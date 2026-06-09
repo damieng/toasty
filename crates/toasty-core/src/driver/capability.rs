@@ -814,6 +814,17 @@ impl Capability {
         vec_pop: false,
         vec_remove_at: false,
     };
+
+    /// MongoDB capabilities.
+    ///
+    /// The first cut of the MongoDB driver treats the database as a
+    /// document-per-collection store, the same shape as DynamoDB: each model is
+    /// a collection, relations resolve to a second query, and the planner emits
+    /// key-value operations (`GetByKey`, `QueryPk`, `FindPkByIndex`, `Scan`)
+    /// rather than SQL. The capability flags therefore start as a copy of
+    /// [`DYNAMODB`](Self::DYNAMODB) and will be refined as MongoDB-native
+    /// features (embedded arrays, array operators) are added.
+    pub const MONGODB: Self = Self { ..Self::DYNAMODB };
 }
 
 impl StorageTypes {
@@ -1002,6 +1013,12 @@ mod tests {
     fn test_validate_dynamodb_capability() {
         // DynamoDB has native_varchar=false and varchar=None, should pass
         assert!(Capability::DYNAMODB.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_mongodb_capability() {
+        // MongoDB starts as a DynamoDB-shaped document store, should pass
+        assert!(Capability::MONGODB.validate().is_ok());
     }
 
     #[test]

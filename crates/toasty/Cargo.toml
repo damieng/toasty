@@ -17,6 +17,7 @@ documentation = "https://docs.rs/toasty"
 default = []
 dynamodb = ["dep:toasty-driver-dynamodb"]
 migration = ["dep:serde", "dep:toml", "dep:toml_edit", "toasty-core/serde"]
+mongodb = ["dep:toasty-driver-mongodb"]
 mysql = ["dep:toasty-driver-mysql"]
 postgresql = ["dep:toasty-driver-postgresql"]
 sqlite = ["dep:toasty-driver-sqlite"]
@@ -48,6 +49,7 @@ toasty-core.workspace = true
 
 # Built-in database drivers
 toasty-driver-dynamodb = { workspace = true, optional = true }
+toasty-driver-mongodb = { workspace = true, optional = true }
 toasty-driver-mysql = { workspace = true, optional = true }
 toasty-driver-postgresql = { workspace = true, optional = true }
 toasty-driver-sqlite = { workspace = true, optional = true }

@@ -52,6 +52,18 @@ async fn main() -> toasty::Result<()> {
     let url = std::env::var("TOASTY_CONNECTION_URL")
         .unwrap_or_else(|_| "postgresql://toasty:toasty@localhost:5434/orders".to_string());
 
+    let provider = match url.split(':').next().unwrap_or("") {
+        "postgresql" | "postgres" => "PostgreSQL",
+        "mysql" => "MySQL",
+        "sqlite" => "SQLite",
+        "dynamodb" => "DynamoDB",
+        "mongodb" | "mongodb+srv" => "MongoDB",
+        other => other,
+    };
+
+    println!("Provider: {provider}");
+    println!("URL:      {url}");
+
     let mut db = toasty::Db::builder()
         .models(toasty::models!(crate::*))
         .connect(&url)

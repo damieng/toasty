@@ -35,6 +35,7 @@ impl Connect {
     /// | `postgresql` / `postgres` | PostgreSQL | `postgresql` |
     /// | `mysql` | MySQL | `mysql` |
     /// | `dynamodb` | DynamoDB | `dynamodb` |
+    /// | `mongodb` | MongoDB | `mongodb` |
     /// | `turso` | Turso | `turso` |
     ///
     /// # Errors
@@ -45,6 +46,7 @@ impl Connect {
         #![cfg_attr(
             not(any(
                 feature = "dynamodb",
+                feature = "mongodb",
                 feature = "mysql",
                 feature = "postgresql",
                 feature = "sqlite",
@@ -68,6 +70,18 @@ impl Connect {
             "dynamodb" => {
                 return Err(toasty_core::Error::unsupported_feature(
                     "`dynamodb` feature not enabled",
+                ));
+            }
+
+            #[cfg(feature = "mongodb")]
+            "mongodb" | "mongodb+srv" => {
+                let driver = toasty_driver_mongodb::MongoDb::new(url.to_string()).await?;
+                Box::new(driver)
+            }
+            #[cfg(not(feature = "mongodb"))]
+            "mongodb" | "mongodb+srv" => {
+                return Err(toasty_core::Error::unsupported_feature(
+                    "`mongodb` feature not enabled",
                 ));
             }
 

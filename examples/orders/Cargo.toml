@@ -9,6 +9,7 @@ publish = false
 
 [features]
 default = ["postgresql"]
+mongodb = ["toasty/mongodb"]
 mysql = ["toasty/mysql"]
 postgresql = ["toasty/postgresql"]
 sqlite = ["toasty/sqlite"]
