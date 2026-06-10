@@ -10,7 +10,7 @@ Run the suite with:
 cargo test -p tests --features mongodb --no-default-features -- --test-threads=1
 ```
 
-Current baseline: **327 passing, 239 failing** (out of 566 in the suite).
+Current baseline: **352 passing, 214 failing** (out of 566 in the suite).
 
 ---
 
@@ -67,34 +67,17 @@ db.collection.updateMany(keyFilter, { $set: assignments })
 
 ---
 
-### 3. `DeleteByKey` not implemented (17 failures)
+### 3. `DeleteByKey` (FIXED)
 
-**Root cause:** `exec()` returns `unsupported_feature` for `Operation::DeleteByKey`.
+`exec_delete_by_key` builds the key filter with the shared `pk_in_filter`
+helper (`{ pk_col: { $in: [...] } }`), ANDs in `op.filter` when present, and
+runs `delete_many`, returning the deleted count. MongoDB enforces unique
+indexes natively, so no secondary-index maintenance is needed (unlike the
+DynamoDB driver).
 
-**Failing test modules:** `crud_basic`, `crud_query`, `batch_update_delete`, `relation_has_many_crud`, `relation_has_one_crud`.
-
-**Operation shape** (`crates/toasty-core/src/driver/operation/delete_by_key.rs`):
-
-```rust
-pub struct DeleteByKey {
-    pub table: TableId,
-    pub keys: Vec<stmt::Value>,
-    pub filter: Option<stmt::Expr>,
-    pub condition: Option<stmt::Expr>,
-}
-```
-
-**MongoDB translation:**
-
-```js
-db.collection.deleteMany({ pk_col: { $in: [key1, key2, ...] } })
-```
-
-- Same key-filter construction as `exec_get_by_key`.
-- AND with `op.filter` if set.
-- `op.condition` can return `unsupported_feature` for now.
-
-**DynamoDB reference:** `crates/toasty-driver-dynamodb/src/op/delete_by_key.rs`.
+`op.condition` (optimistic-lock version check) still returns
+`unsupported_feature`; one test depends on it and lands with update/version
+support. Composite primary keys remain gated; see category 4.
 
 ---
 
@@ -182,8 +165,8 @@ if let Some(offset) = op.offset {
 ## Suggested implementation order
 
 1. ~~**Primary-key `Value::Record` flattening**~~ — done; see category 1.
-2. **`UpdateByKey`** — 135 tests, needed for any test that mutates data after creation.
-3. **`DeleteByKey`** — 32 tests, completes the basic CRUD surface.
+2. ~~**`DeleteByKey`**~~ — done; see category 3.
+3. **`UpdateByKey`** — 139 tests, needed for any test that mutates data after creation.
 4. **Filter expressions** (`ExprNot`, `ExprStartsWith`, `ExprBetween`, `ExprAnyOp`) — 33 tests, all isolated to `filter.rs`.
 5. **Pagination** — 15 tests, small change to two `find()` call sites.
 6. **Composite primary keys** — 18 tests. `pk_field` already flattens by key-column position, so it generalizes to composite keys; the remaining work is the multi-column filter construction in `exec_get_by_key`.

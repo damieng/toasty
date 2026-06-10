@@ -19,9 +19,10 @@
 //!
 //! Implemented operations: [`push_schema`](Connection::push_schema), insert,
 //! [`Scan`](operation::Scan), [`QueryPk`](operation::QueryPk),
-//! [`GetByKey`](operation::GetByKey), and
-//! [`FindPkByIndex`](operation::FindPkByIndex). Updates, deletes, transactions,
-//! and migrations are not yet supported.
+//! [`GetByKey`](operation::GetByKey),
+//! [`DeleteByKey`](operation::DeleteByKey), and
+//! [`FindPkByIndex`](operation::FindPkByIndex). Updates, transactions, and
+//! migrations are not yet supported.
 
 mod filter;
 mod value;
@@ -170,9 +171,7 @@ impl toasty_core::driver::Connection for Connection {
             Operation::UpdateByKey(_) => Err(Error::unsupported_feature(
                 "updates are not yet supported by the MongoDB driver",
             )),
-            Operation::DeleteByKey(_) => Err(Error::unsupported_feature(
-                "deletes are not yet supported by the MongoDB driver",
-            )),
+            Operation::DeleteByKey(op) => self.exec_delete_by_key(schema, op).await,
             Operation::RawSql(_) => Err(Error::unsupported_feature(
                 "raw SQL is only supported by SQL drivers",
             )),
@@ -366,20 +365,7 @@ impl Connection {
             ));
         }
 
-        let pk_name = pk_columns[0].name.clone();
-        // Each key is the full primary-key value, wrapped in a `Value::Record`
-        // (one field per key column). Unwrap to the single key column's field
-        // so the filter compares against the scalar stored on insert.
-        let key_values: Vec<Bson> = op
-            .keys
-            .iter()
-            .map(|key| Value::from(pk_field(table, pk_columns[0], key).clone()).to_bson())
-            .collect();
-
-        let mut in_clause = Document::new();
-        in_clause.insert("$in", key_values);
-        let mut query = Document::new();
-        query.insert(pk_name, in_clause);
+        let query = pk_in_filter(table, pk_columns[0], &op.keys);
 
         let columns: Vec<&Column> = op.select.iter().map(|&id| schema.db.column(id)).collect();
 
@@ -390,6 +376,46 @@ impl Connection {
             .collect();
 
         Ok(rows_response(rows))
+    }
+
+    async fn exec_delete_by_key(
+        &self,
+        schema: &Arc<Schema>,
+        op: operation::DeleteByKey,
+    ) -> Result<ExecResponse> {
+        // Optimistic-lock conditions are not yet supported; a plain key/filter
+        // delete is. MongoDB enforces unique indexes natively, so no secondary
+        // index maintenance is needed (unlike the DynamoDB driver).
+        if op.condition.is_some() {
+            return Err(Error::unsupported_feature(
+                "delete conditions are not yet supported by the MongoDB driver",
+            ));
+        }
+
+        let table = schema.db.table(op.table);
+        let pk_columns: Vec<&Column> = table.primary_key_columns().collect();
+
+        if pk_columns.len() != 1 {
+            return Err(Error::unsupported_feature(
+                "composite primary keys are not yet supported by the MongoDB driver",
+            ));
+        }
+
+        let mut query = pk_in_filter(table, pk_columns[0], &op.keys);
+
+        if let Some(filter) = &op.filter {
+            let cx = ExprContext::new_with_target(&schema.db, table);
+            let extra = filter::translate_filter(&cx, filter);
+            query = and_documents(query, extra);
+        }
+
+        let result = self
+            .collection(&table.name)
+            .delete_many(query)
+            .await
+            .map_err(Error::driver_operation_failed)?;
+
+        Ok(ExecResponse::count(result.deleted_count))
     }
 
     async fn exec_find_pk_by_index(
@@ -479,6 +505,23 @@ fn pk_field<'v>(table: &db::Table, column: &Column, key: &'v stmt::Value) -> &'v
         }
         value => value,
     }
+}
+
+/// Builds a `{ pk_col: { $in: [...] } }` filter selecting rows by primary key.
+///
+/// Each key is flattened with [`pk_field`] to the single key column's scalar,
+/// matching the value stored on insert.
+fn pk_in_filter(table: &db::Table, pk_column: &Column, keys: &[stmt::Value]) -> Document {
+    let key_values: Vec<Bson> = keys
+        .iter()
+        .map(|key| Value::from(pk_field(table, pk_column, key).clone()).to_bson())
+        .collect();
+
+    let mut in_clause = Document::new();
+    in_clause.insert("$in", key_values);
+    let mut query = Document::new();
+    query.insert(pk_column.name.clone(), in_clause);
+    query
 }
 
 /// Combines two query documents with `$and`.
