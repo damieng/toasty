@@ -22,8 +22,8 @@
 //! [`GetByKey`](operation::GetByKey),
 //! [`UpdateByKey`](operation::UpdateByKey),
 //! [`DeleteByKey`](operation::DeleteByKey), and
-//! [`FindPkByIndex`](operation::FindPkByIndex). Optimistic-lock conditions,
-//! transactions, and migrations are not yet supported.
+//! [`FindPkByIndex`](operation::FindPkByIndex). Transactions and migrations
+//! are not yet supported.
 
 mod filter;
 mod value;
@@ -380,31 +380,47 @@ impl Connection {
         schema: &Arc<Schema>,
         op: operation::DeleteByKey,
     ) -> Result<ExecResponse> {
-        // Optimistic-lock conditions are not yet supported; a plain key/filter
-        // delete is. MongoDB enforces unique indexes natively, so no secondary
-        // index maintenance is needed (unlike the DynamoDB driver).
-        if op.condition.is_some() {
-            return Err(Error::unsupported_feature(
-                "delete conditions are not yet supported by the MongoDB driver",
-            ));
-        }
-
+        // MongoDB enforces unique indexes natively, so no secondary index
+        // maintenance is needed (unlike the DynamoDB driver).
         let table = schema.db.table(op.table);
         let pk_columns: Vec<&Column> = table.primary_key_columns().collect();
+        let cx = ExprContext::new_with_target(&schema.db, table);
 
-        let mut query = pk_in_filter(table, &pk_columns, &op.keys);
-
+        let mut base = pk_in_filter(table, &pk_columns, &op.keys);
         if let Some(filter) = &op.filter {
-            let cx = ExprContext::new_with_target(&schema.db, table);
-            let extra = filter::translate_filter(&cx, filter);
-            query = and_documents(query, extra);
+            base = and_documents(base, filter::translate_filter(&cx, filter));
         }
 
-        let result = self
-            .collection(&table.name)
+        let collection = self.collection(&table.name);
+
+        let Some(condition) = &op.condition else {
+            let result = collection
+                .delete_many(base)
+                .await
+                .map_err(Error::driver_operation_failed)?;
+            return Ok(ExecResponse::count(result.deleted_count));
+        };
+
+        // Optimistic-lock condition: a present row that fails the condition is
+        // an error, not a silent no-op. Count the rows the key/filter selects,
+        // then delete only those that also satisfy the condition; a shortfall
+        // means the condition failed.
+        let present = collection
+            .count_documents(base.clone())
+            .await
+            .map_err(Error::driver_operation_failed)?;
+
+        let query = and_documents(base, filter::translate_filter(&cx, condition));
+        let result = collection
             .delete_many(query)
             .await
             .map_err(Error::driver_operation_failed)?;
+
+        if result.deleted_count < present {
+            return Err(Error::condition_failed(
+                "delete condition not met (stale optimistic-lock version)",
+            ));
+        }
 
         Ok(ExecResponse::count(result.deleted_count))
     }
@@ -414,36 +430,58 @@ impl Connection {
         schema: &Arc<Schema>,
         op: operation::UpdateByKey,
     ) -> Result<ExecResponse> {
-        // Optimistic-lock conditions (e.g. a `#[version]` check) require
-        // distinguishing "row missing / filtered out" from "row present but
-        // condition failed". MongoDB's update operators don't surface that
-        // directly, so conditions are a follow-up. The version *bump* itself is
-        // an ordinary assignment and is handled below.
-        if op.condition.is_some() {
-            return Err(Error::unsupported_feature(
-                "update conditions are not yet supported by the MongoDB driver",
-            ));
-        }
-
+        // The `#[version]` bump is an ordinary assignment handled by
+        // `build_update_doc`; `op.condition` is the optimistic-lock check
+        // (e.g. `version == n`). A present row that fails the condition is an
+        // error, not a silent no-op, so it is applied separately below rather
+        // than folded into `op.filter`.
         let table = schema.db.table(op.table);
         let pk_columns: Vec<&Column> = table.primary_key_columns().collect();
+        let cx = ExprContext::new_with_target(&schema.db, table);
 
         let update = build_update_doc(table, &op.assignments)?;
         let collection = self.collection(&table.name);
 
-        let mut filter = pk_in_filter(table, &pk_columns, &op.keys);
-        if let Some(post_filter) = &op.filter {
-            let cx = ExprContext::new_with_target(&schema.db, table);
-            let extra = filter::translate_filter(&cx, post_filter);
-            filter = and_documents(filter, extra);
-        }
+        let base_filter = |keys: &[stmt::Value]| {
+            let mut filter = pk_in_filter(table, &pk_columns, keys);
+            if let Some(post_filter) = &op.filter {
+                filter = and_documents(filter, filter::translate_filter(&cx, post_filter));
+            }
+            filter
+        };
+        let with_condition = |filter: Document| match &op.condition {
+            Some(condition) => and_documents(filter, filter::translate_filter(&cx, condition)),
+            None => filter,
+        };
 
         match &op.returning {
             None => {
+                let base = base_filter(&op.keys);
+
+                // When a condition is present, count the selected rows first so
+                // a shortfall after the conditioned update signals a stale lock.
+                let present = match &op.condition {
+                    Some(_) => Some(
+                        collection
+                            .count_documents(base.clone())
+                            .await
+                            .map_err(Error::driver_operation_failed)?,
+                    ),
+                    None => None,
+                };
+
                 let result = collection
-                    .update_many(filter, update)
+                    .update_many(with_condition(base), update)
                     .await
                     .map_err(Error::driver_operation_failed)?;
+
+                if let Some(present) = present
+                    && result.matched_count < present
+                {
+                    return Err(Error::condition_failed(
+                        "update condition not met (stale optimistic-lock version)",
+                    ));
+                }
 
                 Ok(ExecResponse::count(result.matched_count))
             }
@@ -457,22 +495,31 @@ impl Connection {
 
                 let mut rows = Vec::new();
                 for key in &op.keys {
-                    let mut key_filter =
-                        pk_in_filter(table, &pk_columns, std::slice::from_ref(key));
-                    if let Some(post_filter) = &op.filter {
-                        let cx = ExprContext::new_with_target(&schema.db, table);
-                        let extra = filter::translate_filter(&cx, post_filter);
-                        key_filter = and_documents(key_filter, extra);
-                    }
+                    let base = base_filter(std::slice::from_ref(key));
 
                     let updated = collection
-                        .find_one_and_update(key_filter, update.clone())
+                        .find_one_and_update(with_condition(base.clone()), update.clone())
                         .return_document(ReturnDocument::After)
                         .await
                         .map_err(Error::driver_operation_failed)?;
 
-                    if let Some(doc) = updated {
-                        rows.push(document_to_record(&doc, columns.iter().copied()));
+                    match updated {
+                        Some(doc) => rows.push(document_to_record(&doc, columns.iter().copied())),
+                        // No match: with a condition, a row that still exists
+                        // means the condition failed (stale lock); otherwise the
+                        // row was absent or filtered out.
+                        None if op.condition.is_some() => {
+                            let present = collection
+                                .count_documents(base)
+                                .await
+                                .map_err(Error::driver_operation_failed)?;
+                            if present > 0 {
+                                return Err(Error::condition_failed(
+                                    "update condition not met (stale optimistic-lock version)",
+                                ));
+                            }
+                        }
+                        None => {}
                     }
                 }
 
