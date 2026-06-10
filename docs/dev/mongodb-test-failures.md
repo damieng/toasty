@@ -10,40 +10,23 @@ Run the suite with:
 cargo test -p tests --features mongodb --no-default-features -- --test-threads=1
 ```
 
-Current baseline: **233 passing, 350 failing** (out of 566 total).
+Current baseline: **327 passing, 239 failing** (out of 566 in the suite).
 
 ---
 
 ## Failure categories
 
-### 1. `Value::Record` not serialized to BSON (176 failures)
+### 1. Primary-key `Value::Record` not flattened (FIXED)
 
-**Root cause:** `crates/toasty-driver-mongodb/src/value.rs` `value_to_bson` hits the catch-all `todo!` for `Value::Record`. This fires even for simple scalar models because the query engine wraps certain values (primary key tuples, and embed struct fields) in a `ValueRecord` before handing them to the driver.
+**Symptom:** `crates/toasty-driver-mongodb/src/value.rs` `value_to_bson` hit the catch-all `todo!` for `Value::Record`, even for simple scalar models.
 
-**Failing test modules (sample):** `type_primitives`, `type_collection`, `type_jiff`, `type_serialize`, `embed_struct`, `embed_struct_optional`, `deferred_embed`, `embed_enum_*`, `relation_*`, `crud_*`, `field_*`, `starts_with`.
+**Root cause:** Toasty represents every primary key as a `Value::Record` — one field per key column, even for a single-column key. On insert, `exec_insert` passed the primary-key column's value (a `Record`) straight to the scalar-only `value_to_bson`, which has no `Record` arm. `exec_get_by_key` had the same gap when building the key filter.
 
-**Files to change:**
+The DynamoDB driver does not hit this because `ddb_key` (`crates/toasty-driver-dynamodb/src/lib.rs`) flattens the key `Record` into per-column scalars before calling its scalar `to_ddb`. The MongoDB driver had no equivalent. (The two drivers share a capability — `Capability::MONGODB = { ..DYNAMODB }` — so the planner emits the same operations for both; an earlier note claiming DynamoDB never emits these Records was wrong.)
 
-- `crates/toasty-driver-mongodb/src/value.rs` — add `Value::Record` arms to `value_to_bson` and `from_bson`
+**Fix:** `pk_field` in `crates/toasty-driver-mongodb/src/lib.rs` extracts the field of a key `Record` for a given key column, mirroring `ddb_key`. `exec_insert` calls it for primary-key columns; `exec_get_by_key` calls it when building the `$in` filter. `value_to_bson` stays scalar-only, so a stray non-key `Record` still fails loudly rather than being silently mis-encoded as a BSON array (which would break the read path: `document_to_record` decodes each column with `from_bson` against its scalar type).
 
-**What to implement:**
-
-`Value::Record` is a tuple of fields. In BSON the natural representation is an embedded `Document`:
-
-```rust
-stmt::Value::Record(record) => {
-    // field names are not carried in ValueRecord; a caller that needs
-    // named fields must zip with the schema columns.
-    // For an unnamed tuple (key tuples, composite PK fragments) use array:
-    Bson::Array(record.fields.iter().map(Self::value_to_bson).collect())
-}
-```
-
-However, for **embed structs** the fields need to land in the *parent* document under prefixed column names (e.g. `shipping_address_street`). The schema mapping layer flattens embed structs to flat columns before the driver sees them, so the insert path receives individual scalar column values rather than nested Records. Verify this by adding a `dbg!` before the `todo!` to confirm the shape in each context.
-
-If Records do appear as nested documents (e.g. from `GetByKey` or `QueryPk` results), they should round-trip through `Bson::Document`; use the column schema from the `ExprContext` to build/read field names.
-
-**DynamoDB reference:** DynamoDB's `value.rs` (`crates/toasty-driver-dynamodb/src/value.rs`) also lacks a `Value::Record` arm but its tests pass because the DynamoDB planner never emits Records in the paths the suite exercises. The MongoDB driver's `exec_insert` is structurally identical but encounters Records — worth adding a failing DynamoDB unit test to confirm the difference before fixing MongoDB.
+This change took the suite from 233 to 327 passing. Most of the remaining failures in modules listed under categories 2–6 are tests that insert a row (now working) and then update, delete, paginate, or filter it.
 
 ---
 
@@ -198,9 +181,9 @@ if let Some(offset) = op.offset {
 
 ## Suggested implementation order
 
-1. **`Value::Record` in `value.rs`** — unblocks 176 tests including nearly all primitive and embed tests, and is a prerequisite for most other fixes.
-2. **`UpdateByKey`** — 85 tests, needed for any test that mutates data after creation.
-3. **`DeleteByKey`** — 17 tests, completes the basic CRUD surface.
-4. **Filter expressions** (`ExprNot`, `ExprStartsWith`, `ExprBetween`, `ExprAnyOp`) — 27 tests, all isolated to `filter.rs`.
+1. ~~**Primary-key `Value::Record` flattening**~~ — done; see category 1.
+2. **`UpdateByKey`** — 135 tests, needed for any test that mutates data after creation.
+3. **`DeleteByKey`** — 32 tests, completes the basic CRUD surface.
+4. **Filter expressions** (`ExprNot`, `ExprStartsWith`, `ExprBetween`, `ExprAnyOp`) — 33 tests, all isolated to `filter.rs`.
 5. **Pagination** — 15 tests, small change to two `find()` call sites.
-6. **Composite primary keys** — 17 tests, requires rethinking the key-filter construction in `exec_get_by_key` and related paths.
+6. **Composite primary keys** — 18 tests. `pk_field` already flattens by key-column position, so it generalizes to composite keys; the remaining work is the multi-column filter construction in `exec_get_by_key`.

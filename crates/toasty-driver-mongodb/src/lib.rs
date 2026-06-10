@@ -253,6 +253,17 @@ impl Connection {
                 let entry = row.entry(i).unwrap();
                 let value = entry.as_value_unwrap();
 
+                // A primary-key column's value arrives wrapped in a
+                // `Value::Record` (Toasty represents every primary key as a
+                // record, one field per key column, even single-column keys).
+                // Unwrap to this column's field before encoding so the scalar
+                // is stored directly. Mirrors the DynamoDB driver's `ddb_key`.
+                let value = if column.primary_key {
+                    pk_field(table, column, value)
+                } else {
+                    value
+                };
+
                 // Skip nulls so absent fields stay absent in the document
                 // rather than being stored as explicit nulls.
                 if !value.is_null() {
@@ -356,10 +367,13 @@ impl Connection {
         }
 
         let pk_name = pk_columns[0].name.clone();
+        // Each key is the full primary-key value, wrapped in a `Value::Record`
+        // (one field per key column). Unwrap to the single key column's field
+        // so the filter compares against the scalar stored on insert.
         let key_values: Vec<Bson> = op
             .keys
             .iter()
-            .map(|key| Value::from(key.clone()).to_bson())
+            .map(|key| Value::from(pk_field(table, pk_columns[0], key).clone()).to_bson())
             .collect();
 
         let mut in_clause = Document::new();
@@ -442,6 +456,29 @@ fn document_to_record<'a>(
     );
 
     stmt::Value::from(record)
+}
+
+/// Extracts the field of a primary-key value that corresponds to a single key
+/// column.
+///
+/// Toasty represents a primary key as a [`stmt::Value::Record`] with one field
+/// per key column, even for single-column keys, so a key column's value reaches
+/// the driver wrapped in a record. This unwraps it to the scalar for `column`.
+/// A value that is already a scalar (not a record) passes through unchanged.
+/// Mirrors the DynamoDB driver's `ddb_key`.
+fn pk_field<'v>(table: &db::Table, column: &Column, key: &'v stmt::Value) -> &'v stmt::Value {
+    match key {
+        stmt::Value::Record(record) => {
+            let index = table
+                .primary_key
+                .columns
+                .iter()
+                .position(|id| *id == column.id)
+                .expect("primary key column missing from its table's primary key");
+            &record[index]
+        }
+        value => value,
+    }
 }
 
 /// Combines two query documents with `$and`.
