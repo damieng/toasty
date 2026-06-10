@@ -20,9 +20,10 @@
 //! Implemented operations: [`push_schema`](Connection::push_schema), insert,
 //! [`Scan`](operation::Scan), [`QueryPk`](operation::QueryPk),
 //! [`GetByKey`](operation::GetByKey),
+//! [`UpdateByKey`](operation::UpdateByKey),
 //! [`DeleteByKey`](operation::DeleteByKey), and
-//! [`FindPkByIndex`](operation::FindPkByIndex). Updates, transactions, and
-//! migrations are not yet supported.
+//! [`FindPkByIndex`](operation::FindPkByIndex). Optimistic-lock conditions,
+//! transactions, and migrations are not yet supported.
 
 mod filter;
 mod value;
@@ -33,7 +34,7 @@ use async_trait::async_trait;
 use mongodb::{
     Client, Collection, Database, IndexModel,
     bson::{Bson, Document},
-    options::IndexOptions,
+    options::{IndexOptions, ReturnDocument},
 };
 use std::{borrow::Cow, sync::Arc};
 use toasty_core::{
@@ -168,9 +169,7 @@ impl toasty_core::driver::Connection for Connection {
             Operation::QueryPk(op) => self.exec_query_pk(schema, op).await,
             Operation::GetByKey(op) => self.exec_get_by_key(schema, op).await,
             Operation::FindPkByIndex(op) => self.exec_find_pk_by_index(schema, op).await,
-            Operation::UpdateByKey(_) => Err(Error::unsupported_feature(
-                "updates are not yet supported by the MongoDB driver",
-            )),
+            Operation::UpdateByKey(op) => self.exec_update_by_key(schema, op).await,
             Operation::DeleteByKey(op) => self.exec_delete_by_key(schema, op).await,
             Operation::RawSql(_) => Err(Error::unsupported_feature(
                 "raw SQL is only supported by SQL drivers",
@@ -418,6 +417,84 @@ impl Connection {
         Ok(ExecResponse::count(result.deleted_count))
     }
 
+    async fn exec_update_by_key(
+        &self,
+        schema: &Arc<Schema>,
+        op: operation::UpdateByKey,
+    ) -> Result<ExecResponse> {
+        // Optimistic-lock conditions (e.g. a `#[version]` check) require
+        // distinguishing "row missing / filtered out" from "row present but
+        // condition failed". MongoDB's update operators don't surface that
+        // directly, so conditions are a follow-up. The version *bump* itself is
+        // an ordinary assignment and is handled below.
+        if op.condition.is_some() {
+            return Err(Error::unsupported_feature(
+                "update conditions are not yet supported by the MongoDB driver",
+            ));
+        }
+
+        let table = schema.db.table(op.table);
+        let pk_columns: Vec<&Column> = table.primary_key_columns().collect();
+
+        if pk_columns.len() != 1 {
+            return Err(Error::unsupported_feature(
+                "composite primary keys are not yet supported by the MongoDB driver",
+            ));
+        }
+
+        let update = build_update_doc(table, &op.assignments)?;
+        let collection = self.collection(&table.name);
+
+        let mut filter = pk_in_filter(table, pk_columns[0], &op.keys);
+        if let Some(post_filter) = &op.filter {
+            let cx = ExprContext::new_with_target(&schema.db, table);
+            let extra = filter::translate_filter(&cx, post_filter);
+            filter = and_documents(filter, extra);
+        }
+
+        match &op.returning {
+            None => {
+                let result = collection
+                    .update_many(filter, update)
+                    .await
+                    .map_err(Error::driver_operation_failed)?;
+
+                Ok(ExecResponse::count(result.matched_count))
+            }
+            Some(returning) => {
+                // `update_many` cannot return documents, and re-querying after
+                // the update would miss rows whose updated columns no longer
+                // match `op.filter`. Update each key individually with
+                // `find_one_and_update` returning the post-update document.
+                let columns: Vec<&Column> =
+                    returning.iter().map(|&id| schema.db.column(id)).collect();
+
+                let mut rows = Vec::new();
+                for key in &op.keys {
+                    let mut key_filter =
+                        pk_in_filter(table, pk_columns[0], std::slice::from_ref(key));
+                    if let Some(post_filter) = &op.filter {
+                        let cx = ExprContext::new_with_target(&schema.db, table);
+                        let extra = filter::translate_filter(&cx, post_filter);
+                        key_filter = and_documents(key_filter, extra);
+                    }
+
+                    let updated = collection
+                        .find_one_and_update(key_filter, update.clone())
+                        .return_document(ReturnDocument::After)
+                        .await
+                        .map_err(Error::driver_operation_failed)?;
+
+                    if let Some(doc) = updated {
+                        rows.push(document_to_record(&doc, columns.iter().copied()));
+                    }
+                }
+
+                Ok(rows_response(rows))
+            }
+        }
+    }
+
     async fn exec_find_pk_by_index(
         &self,
         schema: &Arc<Schema>,
@@ -522,6 +599,91 @@ fn pk_in_filter(table: &db::Table, pk_column: &Column, keys: &[stmt::Value]) -> 
     let mut query = Document::new();
     query.insert(pk_column.name.clone(), in_clause);
     query
+}
+
+/// Translates a set of column assignments into a MongoDB update document.
+///
+/// `Set` → `$set` (or `$unset` when the value is null, matching `exec_insert`,
+/// which omits null fields), `Add` → `$inc`, `Subtract` → `$inc` with the value
+/// negated, and `Append` → `$push` with `$each`. Collection mutations
+/// (`Remove`, `Pop`, `RemoveAt`) are gated off by capability and never reach
+/// the driver.
+fn build_update_doc(table: &db::Table, assignments: &stmt::Assignments) -> Result<Document> {
+    let mut set = Document::new();
+    let mut unset = Document::new();
+    let mut inc = Document::new();
+    let mut push = Document::new();
+
+    for (projection, assignment) in assignments.iter() {
+        let name = table.resolve(projection).name.clone();
+
+        let expr = match assignment {
+            stmt::Assignment::Set(expr)
+            | stmt::Assignment::Add(expr)
+            | stmt::Assignment::Subtract(expr)
+            | stmt::Assignment::Append(expr) => expr,
+            other => {
+                return Err(Error::unsupported_feature(format!(
+                    "the MongoDB driver does not support this assignment: {other:#?}"
+                )));
+            }
+        };
+
+        let stmt::Expr::Value(value) = expr else {
+            return Err(Error::unsupported_feature(format!(
+                "the MongoDB driver only supports constant assignment values: {expr:#?}"
+            )));
+        };
+
+        match assignment {
+            stmt::Assignment::Set(_) if value.is_null() => {
+                unset.insert(name, "");
+            }
+            stmt::Assignment::Set(_) => {
+                set.insert(name, Value::from(value.clone()).to_bson());
+            }
+            stmt::Assignment::Add(_) => {
+                inc.insert(name, Value::from(value.clone()).to_bson());
+            }
+            stmt::Assignment::Subtract(_) => {
+                inc.insert(name, negate_bson(Value::from(value.clone()).to_bson()));
+            }
+            stmt::Assignment::Append(_) => {
+                let items = match Value::from(value.clone()).to_bson() {
+                    Bson::Array(items) => items,
+                    other => vec![other],
+                };
+                push.insert(name, mongodb::bson::doc! { "$each": items });
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let mut update = Document::new();
+    if !set.is_empty() {
+        update.insert("$set", set);
+    }
+    if !unset.is_empty() {
+        update.insert("$unset", unset);
+    }
+    if !inc.is_empty() {
+        update.insert("$inc", inc);
+    }
+    if !push.is_empty() {
+        update.insert("$push", push);
+    }
+    Ok(update)
+}
+
+/// Negates a numeric BSON value, used to turn a `Subtract` assignment into a
+/// negative `$inc`.
+fn negate_bson(value: Bson) -> Bson {
+    match value {
+        Bson::Int32(v) => Bson::Int32(-v),
+        Bson::Int64(v) => Bson::Int64(-v),
+        Bson::Double(v) => Bson::Double(-v),
+        other => other,
+    }
 }
 
 /// Combines two query documents with `$and`.

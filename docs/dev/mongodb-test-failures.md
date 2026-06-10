@@ -10,7 +10,7 @@ Run the suite with:
 cargo test -p tests --features mongodb --no-default-features -- --test-threads=1
 ```
 
-Current baseline: **352 passing, 214 failing** (out of 566 in the suite).
+Current baseline: **475 passing, 91 failing** (out of 566 in the suite).
 
 ---
 
@@ -30,40 +30,27 @@ This change took the suite from 233 to 327 passing. Most of the remaining failur
 
 ---
 
-### 2. `UpdateByKey` not implemented (85 failures)
+### 2. `UpdateByKey` (FIXED)
 
-**Root cause:** `exec()` in `crates/toasty-driver-mongodb/src/lib.rs` returns `unsupported_feature` for `Operation::UpdateByKey`.
+`exec_update_by_key` builds the key filter with `pk_in_filter`, ANDs in
+`op.filter` when present, and translates `op.assignments` into a MongoDB update
+document via `build_update_doc`: `Set` → `$set` (or `$unset` for null), `Add`
+→ `$inc`, `Subtract` → `$inc` with the value negated, `Append` → `$push` with
+`$each`.
 
-**Failing test modules:** `crud_update_macro`, `crud_update_arithmetic`, `crud_query`, `crud_query_macro`, `crud_create_macro`, `crud_basic`, `batch_update_delete`, `field_version`, `field_default_and_update`, `clone_query`, `relation_*`, `filter_*`.
+- `op.returning` is `None`: one `update_many`; return `matched_count`.
+- `op.returning` is `Some`: `update_many` cannot return documents, and
+  re-querying after the update would miss rows whose updated columns no longer
+  match `op.filter`. Each key is updated with `find_one_and_update` returning
+  the post-update document (`ReturnDocument::After`), which also gives correct
+  values for `$inc` assignments.
 
-**Operation shape** (`crates/toasty-core/src/driver/operation/update_by_key.rs`):
-
-```rust
-pub struct UpdateByKey {
-    pub table: TableId,
-    pub keys: Vec<stmt::Value>,       // PK values to match
-    pub assignments: stmt::Assignments, // column → new value
-    pub filter: Option<stmt::Expr>,   // optional post-key filter
-    pub condition: Option<stmt::Expr>,// optimistic-lock condition
-    pub returning: Option<Vec<ColumnId>>,
-}
-```
-
-**MongoDB translation:**
-
-```js
-// keys → { _id: { $in: [key1, key2, ...] } }   (or the PK column name)
-// assignments → { $set: { col: val, ... } }
-db.collection.updateMany(keyFilter, { $set: assignments })
-```
-
-- Iterate `op.keys` to build a `$in` filter on the PK column (same as `exec_get_by_key`).
-- Translate `op.assignments` into a `$set` document.
-- If `op.filter` is set, AND it with the key filter using `and_documents`.
-- `op.condition` (optimistic locking / version check) can be a follow-up; return `unsupported_feature` for now.
-- `op.returning` — return the selected columns after update if set; can be a follow-up.
-
-**DynamoDB reference:** `crates/toasty-driver-dynamodb/src/op/update_by_key.rs` — comprehensive, handles conditions and returning. Good structural reference but heavier than needed for a first pass.
+`op.condition` (optimistic-lock / version check) returns `unsupported_feature`;
+distinguishing "row missing / filtered out" from "row present but condition
+failed" needs more than MongoDB's update operators surface. The version *bump*
+is an ordinary `Add` assignment and works; only the check is deferred. This is
+the remaining cause for the `field_version` / `field_default_and_update`
+failures.
 
 ---
 
@@ -166,7 +153,9 @@ if let Some(offset) = op.offset {
 
 1. ~~**Primary-key `Value::Record` flattening**~~ — done; see category 1.
 2. ~~**`DeleteByKey`**~~ — done; see category 3.
-3. **`UpdateByKey`** — 139 tests, needed for any test that mutates data after creation.
+3. ~~**`UpdateByKey`**~~ — done; see category 2.
 4. **Filter expressions** (`ExprNot`, `ExprStartsWith`, `ExprBetween`, `ExprAnyOp`) — 33 tests, all isolated to `filter.rs`.
-5. **Pagination** — 15 tests, small change to two `find()` call sites.
-6. **Composite primary keys** — 18 tests. `pk_field` already flattens by key-column position, so it generalizes to composite keys; the remaining work is the multi-column filter construction in `exec_get_by_key`.
+5. **Composite primary keys** — 22 tests. `pk_field` already flattens by key-column position, so it generalizes to composite keys; the remaining work is the multi-column filter construction in `exec_get_by_key` and `pk_in_filter`.
+6. **Pagination** — 15 tests, small change to the `find()` call sites.
+7. **Optimistic-lock conditions** — 14 tests (`update`/`delete` conditions); needs to distinguish a filtered-out row from a condition failure.
+8. **Unique index on nullable columns** — 2 tests. `exec_insert` omits null fields, and a plain MongoDB unique index rejects a second missing/null value (`E11000`). SQL allows multiple NULLs; `push_schema` should create unique indexes on nullable columns as sparse (or partial on existence).
