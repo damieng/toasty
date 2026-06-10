@@ -88,6 +88,35 @@ pub(crate) fn translate_filter(cx: &ExprContext<'_, db::Schema>, expr: &stmt::Ex
             doc.insert(field, true);
             doc
         }
+        stmt::Expr::AnyOp(any_op) if any_op.op == stmt::BinaryOp::Eq => {
+            // `lhs = ANY(rhs)`. Two orientations reach the driver:
+            match (&*any_op.lhs, &*any_op.rhs) {
+                // `value = ANY(arrayColumn)` — does the array column contain
+                // the value? Matching a MongoDB array field against a scalar
+                // tests element membership. `contains`/`intersects`/
+                // `is_superset` decompose into these, combined by `$or`/`$and`.
+                (value, stmt::Expr::Reference(_)) => {
+                    let field = field_name(cx, &any_op.rhs);
+                    let mut doc = Document::new();
+                    doc.insert(field, expr_to_bson(value));
+                    doc
+                }
+                // `scalarColumn = ANY(literalArray)` — column IN list.
+                (stmt::Expr::Reference(_), list) => {
+                    let field = field_name(cx, &any_op.lhs);
+                    let items = match expr_to_bson(list) {
+                        Bson::Array(items) => items,
+                        other => vec![other],
+                    };
+                    let mut inner = Document::new();
+                    inner.insert("$in", items);
+                    let mut doc = Document::new();
+                    doc.insert(field, inner);
+                    doc
+                }
+                _ => todo!("unsupported ANY operands: {any_op:#?}"),
+            }
+        }
         stmt::Expr::StartsWith(starts_with) => {
             let field = field_name(cx, &starts_with.expr);
             let prefix = match expr_to_bson(&starts_with.prefix) {
