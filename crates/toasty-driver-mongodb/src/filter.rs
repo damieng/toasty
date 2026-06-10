@@ -55,10 +55,15 @@ pub(crate) fn translate_filter(cx: &ExprContext<'_, db::Schema>, expr: &stmt::Ex
         }
         stmt::Expr::InList(in_list) => {
             let field = field_name(cx, &in_list.expr);
-            let items = match expr_to_bson(&in_list.list) {
+            // Drop null operands: a NULL in a SQL `IN` list matches nothing,
+            // whereas MongoDB's `$in: [null]` would match missing/null fields.
+            let items: Vec<Bson> = match expr_to_bson(&in_list.list) {
                 Bson::Array(items) => items,
                 other => vec![other],
-            };
+            }
+            .into_iter()
+            .filter(|item| !matches!(item, Bson::Null))
+            .collect();
 
             let mut inner = Document::new();
             inner.insert("$in", items);
