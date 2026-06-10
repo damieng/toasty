@@ -232,7 +232,10 @@ impl toasty_core::driver::Connection for Connection {
     }
 
     async fn applied_migrations(&mut self) -> Result<Vec<db::AppliedMigration>> {
-        todo!("MongoDB migrations are not yet implemented")
+        Err(Error::unsupported_feature(
+            "MongoDB migrations are not supported: MongoDB has no DDL, so schema \
+             changes are application-level data migrations",
+        ))
     }
 
     async fn apply_migration(
@@ -241,7 +244,10 @@ impl toasty_core::driver::Connection for Connection {
         _name: &str,
         _migration: &db::Migration,
     ) -> Result<()> {
-        todo!("MongoDB migrations are not yet implemented")
+        Err(Error::unsupported_feature(
+            "MongoDB migrations are not supported: MongoDB has no DDL, so schema \
+             changes are application-level data migrations",
+        ))
     }
 }
 
