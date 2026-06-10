@@ -83,6 +83,16 @@ pub(crate) fn translate_filter(cx: &ExprContext<'_, db::Schema>, expr: &stmt::Ex
             doc.insert(field, true);
             doc
         }
+        stmt::Expr::Not(not) => {
+            // MongoDB's `$not` only negates a single field's operator
+            // expression, so it cannot wrap an arbitrary translated document.
+            // `$nor` with one operand is the general top-level negation:
+            // `$nor: [P]` matches exactly the documents that do not match `P`.
+            let inner = translate_filter(cx, &not.expr);
+            let mut doc = Document::new();
+            doc.insert("$nor", vec![Bson::Document(inner)]);
+            doc
+        }
         _ => todo!("unsupported filter expr: {expr:#?}"),
     }
 }
