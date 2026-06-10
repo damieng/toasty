@@ -309,6 +309,7 @@ impl Connection {
             .filter
             .as_ref()
             .map(|expr| filter::translate_filter(&cx, expr))
+            .transpose()?
             .unwrap_or_default();
 
         let columns: Vec<&Column> = op
@@ -341,9 +342,9 @@ impl Connection {
         let table = schema.db.table(op.table);
         let cx = ExprContext::new_with_target(&schema.db, table);
 
-        let mut query = filter::translate_filter(&cx, &op.pk_filter);
+        let mut query = filter::translate_filter(&cx, &op.pk_filter)?;
         if let Some(post_filter) = &op.filter {
-            let extra = filter::translate_filter(&cx, post_filter);
+            let extra = filter::translate_filter(&cx, post_filter)?;
             query = and_documents(query, extra);
         }
 
@@ -394,7 +395,7 @@ impl Connection {
 
         let mut base = pk_in_filter(table, &pk_columns, &op.keys);
         if let Some(filter) = &op.filter {
-            base = and_documents(base, filter::translate_filter(&cx, filter));
+            base = and_documents(base, filter::translate_filter(&cx, filter)?);
         }
 
         let collection = self.collection(&table.name);
@@ -416,7 +417,7 @@ impl Connection {
             .await
             .map_err(Error::driver_operation_failed)?;
 
-        let query = and_documents(base, filter::translate_filter(&cx, condition));
+        let query = and_documents(base, filter::translate_filter(&cx, condition)?);
         let result = collection
             .delete_many(query)
             .await
@@ -448,21 +449,26 @@ impl Connection {
         let update = build_update_doc(table, &op.assignments)?;
         let collection = self.collection(&table.name);
 
-        let base_filter = |keys: &[stmt::Value]| {
+        let base_filter = |keys: &[stmt::Value]| -> Result<Document> {
             let mut filter = pk_in_filter(table, &pk_columns, keys);
             if let Some(post_filter) = &op.filter {
-                filter = and_documents(filter, filter::translate_filter(&cx, post_filter));
+                filter = and_documents(filter, filter::translate_filter(&cx, post_filter)?);
             }
-            filter
+            Ok(filter)
         };
-        let with_condition = |filter: Document| match &op.condition {
-            Some(condition) => and_documents(filter, filter::translate_filter(&cx, condition)),
-            None => filter,
+        let with_condition = |filter: Document| -> Result<Document> {
+            match &op.condition {
+                Some(condition) => Ok(and_documents(
+                    filter,
+                    filter::translate_filter(&cx, condition)?,
+                )),
+                None => Ok(filter),
+            }
         };
 
         match &op.returning {
             None => {
-                let base = base_filter(&op.keys);
+                let base = base_filter(&op.keys)?;
 
                 // When a condition is present, count the selected rows first so
                 // a shortfall after the conditioned update signals a stale lock.
@@ -477,7 +483,7 @@ impl Connection {
                 };
 
                 let result = collection
-                    .update_many(with_condition(base), update)
+                    .update_many(with_condition(base)?, update)
                     .await
                     .map_err(Error::driver_operation_failed)?;
 
@@ -501,10 +507,10 @@ impl Connection {
 
                 let mut rows = Vec::new();
                 for key in &op.keys {
-                    let base = base_filter(std::slice::from_ref(key));
+                    let base = base_filter(std::slice::from_ref(key))?;
 
                     let updated = collection
-                        .find_one_and_update(with_condition(base.clone()), update.clone())
+                        .find_one_and_update(with_condition(base.clone())?, update.clone())
                         .return_document(ReturnDocument::After)
                         .await
                         .map_err(Error::driver_operation_failed)?;
@@ -542,7 +548,7 @@ impl Connection {
         let table = schema.db.table(op.table);
         let cx = ExprContext::new_with_target(&schema.db, table);
 
-        let query = filter::translate_filter(&cx, &op.filter);
+        let query = filter::translate_filter(&cx, &op.filter)?;
 
         let pk_columns: Vec<&Column> = table.primary_key_columns().collect();
 
