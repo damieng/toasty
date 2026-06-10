@@ -85,6 +85,18 @@ impl MongoDb {
         })
     }
 
+    /// Create a driver from an already-initialized [`Client`].
+    ///
+    /// Useful in tests where the client must be kept alive on a dedicated
+    /// runtime to prevent cancellation of MongoDB's background SDAM tasks.
+    pub fn with_client(url: String, client: Client, db_name: String) -> Self {
+        Self {
+            url,
+            client,
+            db_name,
+        }
+    }
+
     fn database(&self) -> Database {
         self.client.database(&self.db_name)
     }

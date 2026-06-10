@@ -1,13 +1,16 @@
 #![cfg(feature = "mongodb")]
 
 use mongodb::{Client, bson::Document};
-use std::sync::OnceLock;
 use toasty_driver_mongodb::MongoDb;
 
 struct MongoDbSetup {
     url: String,
     db_name: String,
-    client: OnceLock<Client>,
+    client: Client,
+    // Keeps MongoDB's SDAM background tasks alive for the duration of the test
+    // suite. The tasks are spawned on this runtime when the Client is created;
+    // dropping it would cancel them and leave all servers in "Unknown" state.
+    _bg_runtime: tokio::runtime::Runtime,
 }
 
 impl MongoDbSetup {
@@ -24,46 +27,42 @@ impl MongoDbSetup {
             })
             .unwrap_or_else(|| "toasty_tests".to_string());
 
+        let (client, bg_runtime) = std::thread::spawn({
+            let url = url.clone();
+            move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let client = rt.block_on(Client::with_uri_str(&url)).unwrap();
+                (client, rt)
+            }
+        })
+        .join()
+        .unwrap();
+
         MongoDbSetup {
             url,
             db_name,
-            client: OnceLock::new(),
+            client,
+            _bg_runtime: bg_runtime,
         }
-    }
-
-    fn get_client(&self) -> &Client {
-        let url = self.url.clone();
-        self.client.get_or_init(|| {
-            std::thread::spawn(move || {
-                tokio::runtime::Runtime::new()
-                    .unwrap()
-                    .block_on(Client::with_uri_str(&url))
-                    .unwrap()
-            })
-            .join()
-            .unwrap()
-        })
     }
 }
 
 #[async_trait::async_trait]
 impl toasty_driver_integration_suite::Setup for MongoDbSetup {
     fn driver(&self) -> Box<dyn toasty_core::driver::Driver> {
-        let url = self.url.clone();
-        let driver = std::thread::spawn(move || {
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(MongoDb::new(url))
-                .unwrap()
-        })
-        .join()
-        .unwrap();
-        Box::new(driver)
+        Box::new(MongoDb::with_client(
+            self.url.clone(),
+            self.client.clone(),
+            self.db_name.clone(),
+        ))
     }
 
     async fn delete_table(&self, name: &str) {
-        let client = self.get_client();
-        let _ = client
+        let _ = self
+            .client
             .database(&self.db_name)
             .collection::<Document>(name)
             .drop()
