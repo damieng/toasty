@@ -88,6 +88,22 @@ pub(crate) fn translate_filter(cx: &ExprContext<'_, db::Schema>, expr: &stmt::Ex
             doc.insert(field, true);
             doc
         }
+        stmt::Expr::StartsWith(starts_with) => {
+            let field = field_name(cx, &starts_with.expr);
+            let prefix = match expr_to_bson(&starts_with.prefix) {
+                Bson::String(prefix) => prefix,
+                other => todo!("starts_with prefix must be a string, got {other:?}"),
+            };
+
+            // Anchor a case-sensitive prefix match. The prefix is a literal, so
+            // its regex metacharacters are escaped.
+            let mut inner = Document::new();
+            inner.insert("$regex", format!("^{}", regex_escape(&prefix)));
+
+            let mut doc = Document::new();
+            doc.insert(field, inner);
+            doc
+        }
         stmt::Expr::Between(between) => {
             let field = field_name(cx, &between.expr);
 
@@ -111,6 +127,22 @@ pub(crate) fn translate_filter(cx: &ExprContext<'_, db::Schema>, expr: &stmt::Ex
         }
         _ => todo!("unsupported filter expr: {expr:#?}"),
     }
+}
+
+/// Escapes regex metacharacters so a literal string can be embedded in a
+/// `$regex` pattern.
+fn regex_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(
+            ch,
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 /// Resolves a column reference expression to its stored field name.
