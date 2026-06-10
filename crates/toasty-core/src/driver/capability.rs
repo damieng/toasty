@@ -817,13 +817,25 @@ impl Capability {
 
     /// MongoDB capabilities.
     ///
-    /// The first cut of the MongoDB driver treats the database as a
-    /// document-per-collection store, the same shape as DynamoDB: each model is
-    /// a collection, relations resolve to a second query, and the planner emits
-    /// key-value operations (`GetByKey`, `QueryPk`, `FindPkByIndex`, `Scan`)
-    /// rather than SQL. The capability flags therefore start as a copy of
-    /// [`DYNAMODB`](Self::DYNAMODB) and will be refined as MongoDB-native
-    /// features (embedded arrays, array operators) are added.
+    /// The MongoDB driver treats the database as a document-per-collection
+    /// store, the same shape as DynamoDB: each model is a collection, relations
+    /// resolve to a second query, and the planner emits key-value operations
+    /// (`GetByKey`, `QueryPk`, `FindPkByIndex`, `Scan`) rather than SQL. The
+    /// flags therefore mirror [`DYNAMODB`](Self::DYNAMODB).
+    ///
+    /// Audit of the flags MongoDB could plausibly set differently:
+    ///
+    /// * `vec_remove` / `vec_pop` / `vec_remove_at` — MongoDB has `$pull` /
+    ///   `$pop`, but `build_update_doc` does not yet translate those
+    ///   assignments, so the flags stay `false` until it does. Enabling them
+    ///   first would make the planner emit collection mutations the driver
+    ///   rejects.
+    /// * `native_*` temporal/decimal — values are stored with the string
+    ///   encodings from [`StorageTypes::DYNAMODB`]; native BSON `Date` /
+    ///   `Decimal128` encoding is future work.
+    /// * `scan_supports_sort`, `bool_key_type` — MongoDB could support both,
+    ///   but no suite test gates on them and `scan_supports_sort: true` would
+    ///   break the DynamoDB-shaped `scan_order_by_is_error` expectation.
     pub const MONGODB: Self = Self { ..Self::DYNAMODB };
 }
 
