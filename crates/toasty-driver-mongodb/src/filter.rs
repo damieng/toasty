@@ -88,6 +88,17 @@ pub(crate) fn translate_filter(cx: &ExprContext<'_, db::Schema>, expr: &stmt::Ex
             doc.insert(field, true);
             doc
         }
+        stmt::Expr::Between(between) => {
+            let field = field_name(cx, &between.expr);
+
+            let mut inner = Document::new();
+            inner.insert("$gte", expr_to_bson(&between.low));
+            inner.insert("$lte", expr_to_bson(&between.high));
+
+            let mut doc = Document::new();
+            doc.insert(field, inner);
+            doc
+        }
         stmt::Expr::Not(not) => {
             // MongoDB's `$not` only negates a single field's operator
             // expression, so it cannot wrap an arbitrary translated document.
