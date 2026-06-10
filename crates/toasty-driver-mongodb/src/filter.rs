@@ -38,19 +38,28 @@ pub(crate) fn translate_filter(cx: &ExprContext<'_, db::Schema>, expr: &stmt::Ex
             doc
         }
         stmt::Expr::BinaryOp(bin) => {
-            // Identify which side is the column reference; the other side is the
-            // literal it is compared against.
-            let (field, value_expr, op) = match (&*bin.lhs, &*bin.rhs) {
-                (stmt::Expr::Reference(_), _) => (field_name(cx, &bin.lhs), &bin.rhs, bin.op),
-                (_, stmt::Expr::Reference(_)) => (field_name(cx, &bin.rhs), &bin.lhs, flip(bin.op)),
+            // Identify the column-bearing side; the other side is the literal it
+            // is compared against. The subject is a column reference or the
+            // length of an array column.
+            let (subject, value_expr, op) = match (&*bin.lhs, &*bin.rhs) {
+                (stmt::Expr::Reference(_) | stmt::Expr::Length(_), _) => {
+                    (&bin.lhs, &bin.rhs, bin.op)
+                }
+                (_, stmt::Expr::Reference(_) | stmt::Expr::Length(_)) => {
+                    (&bin.rhs, &bin.lhs, flip(bin.op))
+                }
                 _ => todo!("binary op without a column reference: {bin:#?}"),
             };
+
+            if let stmt::Expr::Length(length) = &**subject {
+                return length_filter(cx, &length.expr, op, value_expr);
+            }
 
             let mut inner = Document::new();
             inner.insert(mongo_operator(op), expr_to_bson(value_expr));
 
             let mut doc = Document::new();
-            doc.insert(field, inner);
+            doc.insert(field_name(cx, subject), inner);
             doc
         }
         stmt::Expr::InList(in_list) => {
@@ -156,6 +165,34 @@ pub(crate) fn translate_filter(cx: &ExprContext<'_, db::Schema>, expr: &stmt::Ex
         }
         _ => todo!("unsupported filter expr: {expr:#?}"),
     }
+}
+
+/// Builds a filter on the length of an array column (`LEN(field) <op> n`).
+///
+/// Equality uses MongoDB's `$size`, which matches an exact element count. Other
+/// comparisons need an `$expr` evaluating `$size` against the bound value.
+fn length_filter(
+    cx: &ExprContext<'_, db::Schema>,
+    field_expr: &stmt::Expr,
+    op: stmt::BinaryOp,
+    value_expr: &stmt::Expr,
+) -> Document {
+    let field = field_name(cx, field_expr);
+    let value = expr_to_bson(value_expr);
+
+    let mut doc = Document::new();
+    if op == stmt::BinaryOp::Eq {
+        let mut inner = Document::new();
+        inner.insert("$size", value);
+        doc.insert(field, inner);
+    } else {
+        let mut size = Document::new();
+        size.insert("$size", format!("${field}"));
+        let mut cmp = Document::new();
+        cmp.insert(mongo_operator(op), vec![Bson::Document(size), value]);
+        doc.insert("$expr", cmp);
+    }
+    doc
 }
 
 /// Escapes regex metacharacters so a literal string can be embedded in a
