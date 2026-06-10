@@ -10,7 +10,7 @@ Run the suite with:
 cargo test -p tests --features mongodb --no-default-features -- --test-threads=1
 ```
 
-Current baseline: **503 passing, 63 failing** (out of 566 in the suite).
+Current baseline: **520 passing, 46 failing** (out of 566 in the suite).
 
 ---
 
@@ -93,32 +93,34 @@ Build the filter by iterating `pk_columns` alongside the corresponding key value
 
 ---
 
-### 5. Filter expressions
+### 5. Filter expressions (FIXED)
 
-Each remaining expression type hits the catch-all `todo!` in
-`crates/toasty-driver-mongodb/src/filter.rs`. Each is an independent `match`
-arm in `translate_filter`, done as its own change:
+Each expression type is an independent `match` arm in `translate_filter`
+(`crates/toasty-driver-mongodb/src/filter.rs`):
 
-| Expression | Failures | MongoDB equivalent | Status |
-|---|---|---|---|
-| `ExprNot` | 16 | `{ $nor: [inner] }` (top-level negation; `$not` is field-level only) | **done** |
-| `ExprStartsWith` | 8 | `{ field: { $regex: "^prefix" } }` (escape regex metacharacters) | pending |
-| `ExprBetween` | 6 | `{ field: { $gte: low, $lte: high } }` | pending |
-| `ExprAnyOp` | 3 | `{ field: { $in: [...] } }` when op is `Eq`; otherwise `$elemMatch` | pending |
+| Expression | MongoDB equivalent |
+|---|---|
+| `ExprNot` | `{ $nor: [inner] }` (top-level negation; `$not` is field-level only) |
+| `ExprStartsWith` | `{ field: { $regex: "^prefix" } }`, prefix escaped via `regex_escape` |
+| `ExprBetween` | `{ field: { $gte: low, $lte: high } }` |
+| `ExprAnyOp` (`= ANY`) | `value = ANY(arrayColumn)` → `{ field: value }` (array membership); `scalarColumn = ANY(literalArray)` → `$in` |
 
-**AST shapes** (all in `crates/toasty-core/src/stmt/`):
+`contains` / `intersects` / `is_superset` on a `Vec` field all decompose into
+`value = ANY(arrayColumn)` clauses combined by `$or` / `$and`.
 
-```rust
-ExprNot     { expr: Box<Expr> }
-ExprStartsWith { expr: Box<Expr>, prefix: Box<Expr> }
-ExprBetween { expr: Box<Expr>, low: Box<Expr>, high: Box<Expr> }
-ExprAnyOp   { lhs: Box<Expr>, op: BinaryOp, rhs: Box<Expr> }  // rhs is array
-```
+The `InList` arm also drops null operands from `$in`: a NULL in a SQL `IN`
+list matches nothing, whereas `{ field: { $in: [v, null] } }` would match
+missing/null documents.
 
-Separate from these: `query_in_list::in_list_with_null` is an `InList` (not
-`NOT IN`) case. `{ field: { $in: [v, null] } }` matches missing/null documents
-in MongoDB, but SQL semantics treat a NULL in the list as matching nothing.
-The `InList` arm should drop null operands from the `$in` array.
+Two non-SQL tests assert DynamoDB-specific errors that do not apply to
+MongoDB (which handles the input natively): `starts_with::starts_with_empty_prefix`
+(empty prefix matches all, like SQL `LIKE '%'`) and category 9's composite
+unique index. They need a capability flag or test gate, not a driver change.
+
+Still pending: `LEN(array) = n` (`type_collection::vec_string_len_filter`)
+arrives as `ExprBinaryOp` with an `ExprLength` operand and hits the
+"binary op without a column reference" `todo!`. It maps to
+`{ field: { $size: n } }`.
 
 ---
 
@@ -160,8 +162,9 @@ remaining cause for the `paginate_for_dynamodb` failures.
 2. ~~**`DeleteByKey`**~~ — done; see category 3.
 3. ~~**`UpdateByKey`**~~ — done; see category 2.
 4. ~~**Pagination**~~ — done; see category 6.
-5. **Filter expressions** — done/pending per type; see category 5. `ExprNot` done (16); `ExprStartsWith` (8), `ExprBetween` (6), `ExprAnyOp` (3) pending. Plus the `InList`-with-null fix (1).
+5. ~~**Filter expressions**~~ — done (`ExprNot`, `ExprStartsWith`, `ExprBetween`, `ExprAnyOp`, `InList`-with-null); see category 5.
 6. **Composite primary keys** — ~26 tests. `pk_field` already flattens by key-column position, so it generalizes to composite keys; the remaining work is the multi-column filter construction in `exec_get_by_key` / `pk_in_filter` and keyset cursor pagination in `find_paginated`.
 7. **Optimistic-lock conditions** — 14 tests (`update`/`delete` conditions); needs to distinguish a filtered-out row from a condition failure.
-8. **Unique index on nullable columns** — 2–3 tests. `exec_insert` omits null fields, and a plain MongoDB unique index rejects a second missing/null value (`E11000`, on insert and update). SQL allows multiple NULLs; `push_schema` should create unique indexes on nullable columns as sparse (or partial on existence).
-9. **Composite unique indexes** — 1 test. MongoDB supports them natively, so `push_schema` succeeds, but `composite_unique_index_unsupported_on_dynamodb` asserts a DynamoDB-specific `unsupported_feature` error. Needs a capability flag or a test gate rather than a driver change.
+8. **`LEN(array)` filter** — 1 test (`vec_string_len_filter`). `ExprBinaryOp` with an `ExprLength` operand maps to `{ field: { $size: n } }`.
+9. **Unique index on nullable columns** — 2–3 tests. `exec_insert` omits null fields, and a plain MongoDB unique index rejects a second missing/null value (`E11000`, on insert and update). SQL allows multiple NULLs; `push_schema` should create unique indexes on nullable columns as sparse (or partial on existence).
+10. **Composite unique indexes** — 1 test. MongoDB supports them natively, so `push_schema` succeeds, but `composite_unique_index_unsupported_on_dynamodb` asserts a DynamoDB-specific `unsupported_feature` error. Needs a capability flag or a test gate rather than a driver change.
