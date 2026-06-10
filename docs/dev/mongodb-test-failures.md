@@ -10,7 +10,7 @@ Run the suite with:
 cargo test -p tests --features mongodb --no-default-features -- --test-threads=1
 ```
 
-Current baseline: **475 passing, 91 failing** (out of 566 in the suite).
+Current baseline: **487 passing, 79 failing** (out of 566 in the suite).
 
 ---
 
@@ -117,23 +117,23 @@ Add arms to `translate_filter` in `filter.rs` for each. `ExprAnyOp` with `Binary
 
 ---
 
-### 6. Pagination (limit/offset) not implemented (15 failures)
+### 6. Pagination (FIXED)
 
-**Root cause:** Both `exec_scan` and `exec_query_pk` return `unsupported_feature` when `op.limit.is_some()`.
+`find_paginated` handles both `Pagination` variants for `exec_scan` and
+`exec_query_pk`:
 
-**Failing test modules:** `crud_query`, `crud_query_macro`, `starts_with`, `filter_between`.
+- `Offset { limit, offset }` → `.limit(n)` and `.skip(offset)` on the cursor.
+- `Cursor { page_size, after }` → keyset pagination ordered by the primary
+  key, resuming with `{ pk: { $gt: after } }`, returning the last row's key as
+  `next_cursor` (or `None` once a short page is reached).
 
-**MongoDB translation:** use `.limit(n)` and `.skip(offset)` on the cursor:
+`QueryPk.order` sorts by the primary key in that direction. Non-key ordering
+(e.g. `order_by(age().desc())`) is applied by the engine before the limit is
+pushed down, so it never reaches the driver.
 
-```rust
-let mut find = self.collection(collection).find(query);
-if let Some(limit) = op.limit {
-    find = find.limit(limit as i64);
-}
-if let Some(offset) = op.offset {
-    find = find.skip(offset as u64);
-}
-```
+Cursor pagination over a composite primary key is still gated
+(`unsupported_feature`); it lands with composite-key support. This is the
+remaining cause for the `paginate_for_dynamodb` failures.
 
 ---
 
@@ -154,8 +154,9 @@ if let Some(offset) = op.offset {
 1. ~~**Primary-key `Value::Record` flattening**~~ — done; see category 1.
 2. ~~**`DeleteByKey`**~~ — done; see category 3.
 3. ~~**`UpdateByKey`**~~ — done; see category 2.
-4. **Filter expressions** (`ExprNot`, `ExprStartsWith`, `ExprBetween`, `ExprAnyOp`) — 33 tests, all isolated to `filter.rs`.
-5. **Composite primary keys** — 22 tests. `pk_field` already flattens by key-column position, so it generalizes to composite keys; the remaining work is the multi-column filter construction in `exec_get_by_key` and `pk_in_filter`.
-6. **Pagination** — 15 tests, small change to the `find()` call sites.
+4. ~~**Pagination**~~ — done; see category 6.
+5. **Filter expressions** (`ExprNot`, `ExprStartsWith`, `ExprBetween`, `ExprAnyOp`) — 33 tests, all isolated to `filter.rs`. `ExprNot` also covers `IN`-with-null and `IS NOT NULL` cases (`query_in_list::in_list_with_null`, the `option_*` presence tests).
+6. **Composite primary keys** — ~26 tests. `pk_field` already flattens by key-column position, so it generalizes to composite keys; the remaining work is the multi-column filter construction in `exec_get_by_key` / `pk_in_filter` and keyset cursor pagination in `find_paginated`.
 7. **Optimistic-lock conditions** — 14 tests (`update`/`delete` conditions); needs to distinguish a filtered-out row from a condition failure.
-8. **Unique index on nullable columns** — 2 tests. `exec_insert` omits null fields, and a plain MongoDB unique index rejects a second missing/null value (`E11000`). SQL allows multiple NULLs; `push_schema` should create unique indexes on nullable columns as sparse (or partial on existence).
+8. **Unique index on nullable columns** — 2–3 tests. `exec_insert` omits null fields, and a plain MongoDB unique index rejects a second missing/null value (`E11000`, on insert and update). SQL allows multiple NULLs; `push_schema` should create unique indexes on nullable columns as sparse (or partial on existence).
+9. **Composite unique indexes** — 1 test. MongoDB supports them natively, so `push_schema` succeeds, but `composite_unique_index_unsupported_on_dynamodb` asserts a DynamoDB-specific `unsupported_feature` error. Needs a capability flag or a test gate rather than a driver change.

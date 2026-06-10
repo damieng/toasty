@@ -284,12 +284,6 @@ impl Connection {
     }
 
     async fn exec_scan(&self, schema: &Arc<Schema>, op: operation::Scan) -> Result<ExecResponse> {
-        if op.limit.is_some() {
-            return Err(Error::unsupported_feature(
-                "scan pagination is not yet supported by the MongoDB driver",
-            ));
-        }
-
         let table = schema.db.table(op.table);
         let cx = ExprContext::new_with_target(&schema.db, table);
 
@@ -310,13 +304,15 @@ impl Connection {
             })
             .collect();
 
-        let documents = self.find(&table.name, query).await?;
+        // A scan has no sort key; ordering on a scan path is rejected before
+        // reaching the driver, so cursor pagination orders by the primary key.
+        let (documents, next_cursor) = self.find_paginated(table, query, op.limit, None).await?;
         let rows = documents
             .iter()
             .map(|doc| document_to_record(doc, columns.iter().copied()))
             .collect();
 
-        Ok(rows_response(rows))
+        Ok(paginated_response(rows, next_cursor))
     }
 
     async fn exec_query_pk(
@@ -324,12 +320,6 @@ impl Connection {
         schema: &Arc<Schema>,
         op: operation::QueryPk,
     ) -> Result<ExecResponse> {
-        if op.limit.is_some() {
-            return Err(Error::unsupported_feature(
-                "query pagination is not yet supported by the MongoDB driver",
-            ));
-        }
-
         let table = schema.db.table(op.table);
         let cx = ExprContext::new_with_target(&schema.db, table);
 
@@ -341,13 +331,15 @@ impl Connection {
 
         let columns: Vec<&Column> = op.select.iter().map(|&id| schema.db.column(id)).collect();
 
-        let documents = self.find(&table.name, query).await?;
+        let (documents, next_cursor) = self
+            .find_paginated(table, query, op.limit, op.order)
+            .await?;
         let rows = documents
             .iter()
             .map(|doc| document_to_record(doc, columns.iter().copied()))
             .collect();
 
-        Ok(rows_response(rows))
+        Ok(paginated_response(rows, next_cursor))
     }
 
     async fn exec_get_by_key(
@@ -518,13 +510,34 @@ impl Connection {
 
     /// Runs a `find` with the given filter and collects all matching documents.
     async fn find(&self, collection: &str, query: Document) -> Result<Vec<Document>> {
-        tracing::trace!(collection, ?query, "find");
+        self.run_find(collection, query, None, None, None).await
+    }
 
-        let mut cursor = self
-            .collection(collection)
-            .find(query)
-            .await
-            .map_err(Error::driver_operation_failed)?;
+    /// Runs a `find` with optional sort, skip, and limit, collecting the
+    /// matching documents.
+    async fn run_find(
+        &self,
+        collection: &str,
+        query: Document,
+        sort: Option<Document>,
+        skip: Option<u64>,
+        limit: Option<i64>,
+    ) -> Result<Vec<Document>> {
+        tracing::trace!(collection, ?query, ?sort, ?skip, ?limit, "find");
+
+        let coll = self.collection(collection);
+        let mut find = coll.find(query);
+        if let Some(sort) = sort {
+            find = find.sort(sort);
+        }
+        if let Some(skip) = skip {
+            find = find.skip(skip);
+        }
+        if let Some(limit) = limit {
+            find = find.limit(limit);
+        }
+
+        let mut cursor = find.await.map_err(Error::driver_operation_failed)?;
 
         let mut documents = Vec::new();
         while cursor
@@ -540,6 +553,76 @@ impl Connection {
         }
 
         Ok(documents)
+    }
+
+    /// Runs a query with pagination, returning the matching documents and, for
+    /// cursor pagination, the cursor to the next page (`None` once exhausted).
+    ///
+    /// `order` sorts by the primary key in that direction; non-key ordering is
+    /// applied by the engine before the limit is pushed down, so it never
+    /// reaches the driver.
+    async fn find_paginated(
+        &self,
+        table: &db::Table,
+        mut query: Document,
+        limit: Option<operation::Pagination>,
+        order: Option<stmt::Direction>,
+    ) -> Result<(Vec<Document>, Option<stmt::Value>)> {
+        use operation::Pagination;
+
+        let pk_columns: Vec<&Column> = table.primary_key_columns().collect();
+
+        match limit {
+            None => {
+                let docs = self
+                    .run_find(&table.name, query, pk_sort(&pk_columns, order), None, None)
+                    .await?;
+                Ok((docs, None))
+            }
+            Some(Pagination::Offset { limit, offset }) => {
+                let docs = self
+                    .run_find(
+                        &table.name,
+                        query,
+                        pk_sort(&pk_columns, order),
+                        offset.map(|o| o as u64),
+                        Some(limit),
+                    )
+                    .await?;
+                Ok((docs, None))
+            }
+            Some(Pagination::Cursor { page_size, after }) => {
+                let [pk] = pk_columns[..] else {
+                    return Err(Error::unsupported_feature(
+                        "cursor pagination over composite primary keys is not yet supported \
+                         by the MongoDB driver",
+                    ));
+                };
+
+                // Keyset pagination: order by the primary key and resume after
+                // the previous page's last key.
+                if let Some(after) = after {
+                    let bound = mongodb::bson::doc! {
+                        &pk.name: { "$gt": Value::from(after).to_bson() },
+                    };
+                    query = and_documents(query, bound);
+                }
+
+                let sort = mongodb::bson::doc! { &pk.name: 1_i32 };
+                let docs = self
+                    .run_find(&table.name, query, Some(sort), None, Some(page_size))
+                    .await?;
+
+                // A full page may have a successor; a short page is the last.
+                let next_cursor = (docs.len() as i64 == page_size)
+                    .then(|| docs.last())
+                    .flatten()
+                    .and_then(|doc| doc.get(&pk.name))
+                    .map(|bson| Value::from_bson(&pk.ty, bson));
+
+                Ok((docs, next_cursor))
+            }
+        }
     }
 }
 
@@ -582,6 +665,21 @@ fn pk_field<'v>(table: &db::Table, column: &Column, key: &'v stmt::Value) -> &'v
         }
         value => value,
     }
+}
+
+/// Builds a sort document over the primary-key columns in the given direction,
+/// or `None` when no direction is requested.
+fn pk_sort(pk_columns: &[&Column], order: Option<stmt::Direction>) -> Option<Document> {
+    let value = match order? {
+        stmt::Direction::Asc => 1_i32,
+        stmt::Direction::Desc => -1_i32,
+    };
+
+    let mut sort = Document::new();
+    for column in pk_columns {
+        sort.insert(column.name.clone(), value);
+    }
+    Some(sort)
 }
 
 /// Builds a `{ pk_col: { $in: [...] } }` filter selecting rows by primary key.
@@ -695,9 +793,15 @@ fn and_documents(a: Document, b: Document) -> Document {
 
 /// Wraps a vector of row records in an [`ExecResponse`] value stream.
 fn rows_response(rows: Vec<stmt::Value>) -> ExecResponse {
+    paginated_response(rows, None)
+}
+
+/// Wraps row records in an [`ExecResponse`] value stream, carrying the
+/// next-page cursor for cursor-based pagination.
+fn paginated_response(rows: Vec<stmt::Value>, next_cursor: Option<stmt::Value>) -> ExecResponse {
     ExecResponse {
         values: Rows::Stream(stmt::ValueStream::from_vec(rows)),
-        next_cursor: None,
+        next_cursor,
         prev_cursor: None,
     }
 }
