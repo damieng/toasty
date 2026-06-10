@@ -41,6 +41,13 @@ impl Value {
             stmt::Value::U8(val) => Bson::Int32(*val as i32),
             stmt::Value::U16(val) => Bson::Int32(*val as i32),
             stmt::Value::U32(val) => Bson::Int64(*val as i64),
+            // `u64` has no native BSON type. It is stored as the two's-complement
+            // reinterpretation in an `Int64`, which round-trips losslessly with the
+            // `as u64` cast on read (see the `Type::U64` arm in `from_bson`).
+            // Values `>= 2^63` are stored as a negative `Int64`, so MongoDB-side
+            // ordering and range queries over them are not magnitude-correct;
+            // making them so requires `Decimal128` and is deferred to native-BSON
+            // encoding.
             stmt::Value::U64(val) => Bson::Int64(*val as i64),
             stmt::Value::F32(val) => Bson::Double(*val as f64),
             stmt::Value::F64(val) => Bson::Double(*val),
