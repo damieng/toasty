@@ -203,8 +203,20 @@ impl toasty_core::driver::Connection for Connection {
                     keys.insert(column.name.clone(), 1_i32);
                 }
 
+                let unique = index.unique || index.primary_key;
+
+                // `exec_insert` omits null fields, so a nullable column is
+                // absent when null. A plain unique index would reject a second
+                // such document (it indexes a missing field as null); a sparse
+                // index skips them, matching SQL's "multiple NULLs allowed".
+                let nullable = index
+                    .columns
+                    .iter()
+                    .any(|index_column| table.column(index_column.column).nullable);
+
                 let options = IndexOptions::builder()
-                    .unique(index.unique || index.primary_key)
+                    .unique(unique)
+                    .sparse(unique && nullable)
                     .build();
 
                 let model = IndexModel::builder().keys(keys).options(options).build();
