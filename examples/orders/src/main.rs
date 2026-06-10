@@ -49,8 +49,18 @@ struct OrderDetail {
 
 #[tokio::main]
 async fn main() -> toasty::Result<()> {
-    let url = std::env::var("TOASTY_CONNECTION_URL")
-        .unwrap_or_else(|_| "postgresql://toasty:toasty@localhost:5434/orders".to_string());
+    let url = std::env::var("TOASTY_CONNECTION_URL").unwrap_or_else(|_| {
+        if cfg!(feature = "mongodb") {
+            "mongodb://localhost:27017/orders?directConnection=true"
+        } else if cfg!(feature = "mysql") {
+            "mysql://toasty:toasty@localhost/orders"
+        } else if cfg!(feature = "postgresql") {
+            "postgresql://toasty:toasty@localhost:5434/orders"
+        } else {
+            "sqlite::memory:"
+        }
+        .to_string()
+    });
 
     let provider = match url.split(':').next().unwrap_or("") {
         "postgresql" | "postgres" => "PostgreSQL",
