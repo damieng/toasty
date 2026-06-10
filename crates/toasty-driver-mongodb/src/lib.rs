@@ -350,13 +350,7 @@ impl Connection {
         let table = schema.db.table(op.table);
         let pk_columns: Vec<&Column> = table.primary_key_columns().collect();
 
-        if pk_columns.len() != 1 {
-            return Err(Error::unsupported_feature(
-                "composite primary keys are not yet supported by the MongoDB driver",
-            ));
-        }
-
-        let query = pk_in_filter(table, pk_columns[0], &op.keys);
+        let query = pk_in_filter(table, &pk_columns, &op.keys);
 
         let columns: Vec<&Column> = op.select.iter().map(|&id| schema.db.column(id)).collect();
 
@@ -386,13 +380,7 @@ impl Connection {
         let table = schema.db.table(op.table);
         let pk_columns: Vec<&Column> = table.primary_key_columns().collect();
 
-        if pk_columns.len() != 1 {
-            return Err(Error::unsupported_feature(
-                "composite primary keys are not yet supported by the MongoDB driver",
-            ));
-        }
-
-        let mut query = pk_in_filter(table, pk_columns[0], &op.keys);
+        let mut query = pk_in_filter(table, &pk_columns, &op.keys);
 
         if let Some(filter) = &op.filter {
             let cx = ExprContext::new_with_target(&schema.db, table);
@@ -428,16 +416,10 @@ impl Connection {
         let table = schema.db.table(op.table);
         let pk_columns: Vec<&Column> = table.primary_key_columns().collect();
 
-        if pk_columns.len() != 1 {
-            return Err(Error::unsupported_feature(
-                "composite primary keys are not yet supported by the MongoDB driver",
-            ));
-        }
-
         let update = build_update_doc(table, &op.assignments)?;
         let collection = self.collection(&table.name);
 
-        let mut filter = pk_in_filter(table, pk_columns[0], &op.keys);
+        let mut filter = pk_in_filter(table, &pk_columns, &op.keys);
         if let Some(post_filter) = &op.filter {
             let cx = ExprContext::new_with_target(&schema.db, table);
             let extra = filter::translate_filter(&cx, post_filter);
@@ -464,7 +446,7 @@ impl Connection {
                 let mut rows = Vec::new();
                 for key in &op.keys {
                     let mut key_filter =
-                        pk_in_filter(table, pk_columns[0], std::slice::from_ref(key));
+                        pk_in_filter(table, &pk_columns, std::slice::from_ref(key));
                     if let Some(post_filter) = &op.filter {
                         let cx = ExprContext::new_with_target(&schema.db, table);
                         let extra = filter::translate_filter(&cx, post_filter);
@@ -592,23 +574,21 @@ impl Connection {
                 Ok((docs, None))
             }
             Some(Pagination::Cursor { page_size, after }) => {
-                let [pk] = pk_columns[..] else {
-                    return Err(Error::unsupported_feature(
-                        "cursor pagination over composite primary keys is not yet supported \
-                         by the MongoDB driver",
-                    ));
-                };
+                // Keyset pagination requires a deterministic order over the
+                // whole key; resume strictly after the previous page's last key.
+                let direction = order.unwrap_or(stmt::Direction::Asc);
 
-                // Keyset pagination: order by the primary key and resume after
-                // the previous page's last key.
                 if let Some(after) = after {
-                    let bound = mongodb::bson::doc! {
-                        &pk.name: { "$gt": Value::from(after).to_bson() },
-                    };
+                    let bound = keyset_after(table, &pk_columns, &after, direction);
                     query = and_documents(query, bound);
                 }
 
-                let sort = mongodb::bson::doc! { &pk.name: 1_i32 };
+                let sort_value = direction_value(direction);
+                let mut sort = Document::new();
+                for column in &pk_columns {
+                    sort.insert(column.name.clone(), sort_value);
+                }
+
                 let docs = self
                     .run_find(&table.name, query, Some(sort), None, Some(page_size))
                     .await?;
@@ -617,8 +597,7 @@ impl Connection {
                 let next_cursor = (docs.len() as i64 == page_size)
                     .then(|| docs.last())
                     .flatten()
-                    .and_then(|doc| doc.get(&pk.name))
-                    .map(|bson| Value::from_bson(&pk.ty, bson));
+                    .map(|doc| key_cursor(&pk_columns, doc));
 
                 Ok((docs, next_cursor))
             }
@@ -667,13 +646,18 @@ fn pk_field<'v>(table: &db::Table, column: &Column, key: &'v stmt::Value) -> &'v
     }
 }
 
+/// Maps a sort direction to MongoDB's `1` (ascending) / `-1` (descending).
+fn direction_value(direction: stmt::Direction) -> i32 {
+    match direction {
+        stmt::Direction::Asc => 1,
+        stmt::Direction::Desc => -1,
+    }
+}
+
 /// Builds a sort document over the primary-key columns in the given direction,
 /// or `None` when no direction is requested.
 fn pk_sort(pk_columns: &[&Column], order: Option<stmt::Direction>) -> Option<Document> {
-    let value = match order? {
-        stmt::Direction::Asc => 1_i32,
-        stmt::Direction::Desc => -1_i32,
-    };
+    let value = direction_value(order?);
 
     let mut sort = Document::new();
     for column in pk_columns {
@@ -682,20 +666,114 @@ fn pk_sort(pk_columns: &[&Column], order: Option<stmt::Direction>) -> Option<Doc
     Some(sort)
 }
 
-/// Builds a `{ pk_col: { $in: [...] } }` filter selecting rows by primary key.
+/// Builds the keyset bound for resuming cursor pagination strictly after `key`.
 ///
-/// Each key is flattened with [`pk_field`] to the single key column's scalar,
-/// matching the value stored on insert.
-fn pk_in_filter(table: &db::Table, pk_column: &Column, keys: &[stmt::Value]) -> Document {
-    let key_values: Vec<Bson> = keys
+/// For columns `(c1, …, cn)` compared in `direction`, this is the
+/// lexicographic "after" predicate
+/// `{ $or: [ { c1: <cmp> }, { c1: a1, c2: <cmp> }, … ] }`, where `<cmp>` is
+/// `$gt` ascending or `$lt` descending. A single-column key collapses to
+/// `{ c1: { <cmp>: a1 } }`.
+fn keyset_after(
+    table: &db::Table,
+    pk_columns: &[&Column],
+    key: &stmt::Value,
+    direction: stmt::Direction,
+) -> Document {
+    let cmp = match direction {
+        stmt::Direction::Asc => "$gt",
+        stmt::Direction::Desc => "$lt",
+    };
+
+    let field_bson = |column: &Column| Value::from(pk_field(table, column, key).clone()).to_bson();
+
+    let mut branches: Vec<Bson> = Vec::with_capacity(pk_columns.len());
+    for (i, column) in pk_columns.iter().enumerate() {
+        let mut branch = Document::new();
+        // Equality on every earlier key column.
+        for earlier in &pk_columns[..i] {
+            branch.insert(earlier.name.clone(), field_bson(earlier));
+        }
+        // Strict comparison on this column.
+        let mut cmp_doc = Document::new();
+        cmp_doc.insert(cmp, field_bson(column));
+        branch.insert(column.name.clone(), cmp_doc);
+        branches.push(Bson::Document(branch));
+    }
+
+    if branches.len() == 1 {
+        let Bson::Document(branch) = branches.remove(0) else {
+            unreachable!()
+        };
+        return branch;
+    }
+
+    let mut doc = Document::new();
+    doc.insert("$or", branches);
+    doc
+}
+
+/// Builds the cursor value for the last row of a page: the row's primary key —
+/// a scalar for single-column keys, a record for composite keys.
+fn key_cursor(pk_columns: &[&Column], doc: &Document) -> stmt::Value {
+    let field = |column: &Column| match doc.get(&column.name) {
+        Some(bson) => Value::from_bson(&column.ty, bson),
+        None => stmt::Value::Null,
+    };
+
+    if let [pk] = pk_columns {
+        return field(pk);
+    }
+
+    stmt::Value::from(stmt::ValueRecord::from_vec(
+        pk_columns.iter().map(|column| field(column)).collect(),
+    ))
+}
+
+/// Builds a filter selecting rows by primary key.
+///
+/// Each key is flattened with [`pk_field`] to its per-column scalars, matching
+/// the values stored on insert.
+///
+/// - Single-column key: `{ pk_col: { $in: [...] } }`.
+/// - Composite key: `{ $or: [ { c1: v1, c2: v2 }, ... ] }` — one equality
+///   document per key tuple. A single key collapses to the bare document.
+fn pk_in_filter(table: &db::Table, pk_columns: &[&Column], keys: &[stmt::Value]) -> Document {
+    if let [pk_column] = pk_columns {
+        let key_values: Vec<Bson> = keys
+            .iter()
+            .map(|key| Value::from(pk_field(table, pk_column, key).clone()).to_bson())
+            .collect();
+
+        let mut in_clause = Document::new();
+        in_clause.insert("$in", key_values);
+        let mut query = Document::new();
+        query.insert(pk_column.name.clone(), in_clause);
+        return query;
+    }
+
+    let mut branches: Vec<Bson> = keys
         .iter()
-        .map(|key| Value::from(pk_field(table, pk_column, key).clone()).to_bson())
+        .map(|key| {
+            let mut branch = Document::new();
+            for column in pk_columns {
+                branch.insert(
+                    column.name.clone(),
+                    Value::from(pk_field(table, column, key).clone()).to_bson(),
+                );
+            }
+            Bson::Document(branch)
+        })
         .collect();
 
-    let mut in_clause = Document::new();
-    in_clause.insert("$in", key_values);
+    if branches.len() == 1 {
+        let Bson::Document(branch) = branches.remove(0) else {
+            unreachable!()
+        };
+        return branch;
+    }
+
     let mut query = Document::new();
-    query.insert(pk_column.name.clone(), in_clause);
+    query.insert("$or", branches);
     query
 }
 

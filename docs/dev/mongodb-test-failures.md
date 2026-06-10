@@ -10,7 +10,7 @@ Run the suite with:
 cargo test -p tests --features mongodb --no-default-features -- --test-threads=1
 ```
 
-Current baseline: **520 passing, 46 failing** (out of 566 in the suite).
+Current baseline: **546 passing, 20 failing** (out of 566 in the suite).
 
 ---
 
@@ -68,28 +68,22 @@ support. Composite primary keys remain gated; see category 4.
 
 ---
 
-### 4. Composite primary keys not supported (17 failures)
+### 4. Composite primary keys (FIXED)
 
-**Root cause:** `exec_get_by_key` in `crates/toasty-driver-mongodb/src/lib.rs` early-returns `unsupported_feature` when `pk_columns.len() != 1`:
+MongoDB has no native composite primary key; each key column is a separate
+field, and the key value is a `Value::Record` flattened per column by
+`pk_field`.
 
-```rust
-if pk_columns.len() != 1 {
-    return Err(Error::unsupported_feature(
-        "composite primary keys are not yet supported by the MongoDB driver",
-    ));
-}
-```
-
-**Failing test modules:** `relation_has_many_composite_key`, `index_composite`, `relation_chain_composite_key`, `crud_composite_key_in_list`, `crud_composite_key_pagination`.
-
-**MongoDB translation:** MongoDB has no native composite primary key. The convention used by the DynamoDB driver (which the MongoDB driver mirrors) is to concatenate the key columns or store them as a compound filter:
-
-```js
-// For composite key {kind: "A", name: "B"}:
-db.collection.find({ kind: "A", name: "B" })
-```
-
-Build the filter by iterating `pk_columns` alongside the corresponding key values, adding one `$eq` clause per column. For `$in` style multi-key lookup, use `$or` across each key tuple.
+- **Key lookup** (`pk_in_filter`, used by `exec_get_by_key` / `exec_delete_by_key`
+  / `exec_update_by_key`): a single-column key stays `{ pk_col: { $in: [...] } }`;
+  a composite key becomes `{ $or: [ { c1: v1, c2: v2 }, ... ] }` — one equality
+  document per key tuple, collapsing to the bare document for a single key.
+- **Cursor pagination** (`keyset_after` in `find_paginated`): resumes strictly
+  after the previous page's last key with the lexicographic predicate
+  `{ $or: [ { c1: <cmp> }, { c1: a1, c2: <cmp> }, ... ] }`, where `<cmp>` is
+  `$gt` ascending / `$lt` descending. The cursor (`key_cursor`) carries the full
+  key as a `Value::Record`. A fixed partition key in the `pk_filter` makes the
+  partition branch of the `$or` collapse, leaving the sort-key keyset.
 
 ---
 
@@ -138,9 +132,8 @@ arrives as `ExprBinaryOp` with an `ExprLength` operand and hits the
 (e.g. `order_by(age().desc())`) is applied by the engine before the limit is
 pushed down, so it never reaches the driver.
 
-Cursor pagination over a composite primary key is still gated
-(`unsupported_feature`); it lands with composite-key support. This is the
-remaining cause for the `paginate_for_dynamodb` failures.
+Cursor pagination over a composite primary key uses a lexicographic keyset
+bound; see category 4.
 
 ---
 
@@ -163,7 +156,7 @@ remaining cause for the `paginate_for_dynamodb` failures.
 3. ~~**`UpdateByKey`**~~ — done; see category 2.
 4. ~~**Pagination**~~ — done; see category 6.
 5. ~~**Filter expressions**~~ — done (`ExprNot`, `ExprStartsWith`, `ExprBetween`, `ExprAnyOp`, `InList`-with-null); see category 5.
-6. **Composite primary keys** — ~26 tests. `pk_field` already flattens by key-column position, so it generalizes to composite keys; the remaining work is the multi-column filter construction in `exec_get_by_key` / `pk_in_filter` and keyset cursor pagination in `find_paginated`.
+6. ~~**Composite primary keys**~~ — done; see category 4.
 7. **Optimistic-lock conditions** — 14 tests (`update`/`delete` conditions); needs to distinguish a filtered-out row from a condition failure.
 8. **`LEN(array)` filter** — 1 test (`vec_string_len_filter`). `ExprBinaryOp` with an `ExprLength` operand maps to `{ field: { $size: n } }`.
 9. **Unique index on nullable columns** — 2–3 tests. `exec_insert` omits null fields, and a plain MongoDB unique index rejects a second missing/null value (`E11000`, on insert and update). SQL allows multiple NULLs; `push_schema` should create unique indexes on nullable columns as sparse (or partial on existence).
