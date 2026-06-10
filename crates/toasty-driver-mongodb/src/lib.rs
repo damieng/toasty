@@ -283,7 +283,7 @@ impl Connection {
                 // Skip nulls so absent fields stay absent in the document
                 // rather than being stored as explicit nulls.
                 if !value.is_null() {
-                    document.insert(column.name.clone(), Value::from(value.clone()).to_bson());
+                    document.insert(column.name.clone(), Value::from(value.clone()).to_bson()?);
                 }
             }
             documents.push(document);
@@ -329,7 +329,7 @@ impl Connection {
         let rows = documents
             .iter()
             .map(|doc| document_to_record(doc, columns.iter().copied()))
-            .collect();
+            .collect::<Result<_>>()?;
 
         Ok(paginated_response(rows, next_cursor))
     }
@@ -356,7 +356,7 @@ impl Connection {
         let rows = documents
             .iter()
             .map(|doc| document_to_record(doc, columns.iter().copied()))
-            .collect();
+            .collect::<Result<_>>()?;
 
         Ok(paginated_response(rows, next_cursor))
     }
@@ -369,7 +369,7 @@ impl Connection {
         let table = schema.db.table(op.table);
         let pk_columns: Vec<&Column> = table.primary_key_columns().collect();
 
-        let query = pk_in_filter(table, &pk_columns, &op.keys);
+        let query = pk_in_filter(table, &pk_columns, &op.keys)?;
 
         let columns: Vec<&Column> = op.select.iter().map(|&id| schema.db.column(id)).collect();
 
@@ -377,7 +377,7 @@ impl Connection {
         let rows = documents
             .iter()
             .map(|doc| document_to_record(doc, columns.iter().copied()))
-            .collect();
+            .collect::<Result<_>>()?;
 
         Ok(rows_response(rows))
     }
@@ -393,7 +393,7 @@ impl Connection {
         let pk_columns: Vec<&Column> = table.primary_key_columns().collect();
         let cx = ExprContext::new_with_target(&schema.db, table);
 
-        let mut base = pk_in_filter(table, &pk_columns, &op.keys);
+        let mut base = pk_in_filter(table, &pk_columns, &op.keys)?;
         if let Some(filter) = &op.filter {
             base = and_documents(base, filter::translate_filter(&cx, filter)?);
         }
@@ -450,7 +450,7 @@ impl Connection {
         let collection = self.collection(&table.name);
 
         let base_filter = |keys: &[stmt::Value]| -> Result<Document> {
-            let mut filter = pk_in_filter(table, &pk_columns, keys);
+            let mut filter = pk_in_filter(table, &pk_columns, keys)?;
             if let Some(post_filter) = &op.filter {
                 filter = and_documents(filter, filter::translate_filter(&cx, post_filter)?);
             }
@@ -516,7 +516,7 @@ impl Connection {
                         .map_err(Error::driver_operation_failed)?;
 
                     match updated {
-                        Some(doc) => rows.push(document_to_record(&doc, columns.iter().copied())),
+                        Some(doc) => rows.push(document_to_record(&doc, columns.iter().copied())?),
                         // No match: with a condition, a row that still exists
                         // means the condition failed (stale lock); otherwise the
                         // row was absent or filtered out.
@@ -556,7 +556,7 @@ impl Connection {
         let rows = documents
             .iter()
             .map(|doc| document_to_record(doc, pk_columns.iter().copied()))
-            .collect();
+            .collect::<Result<_>>()?;
 
         Ok(rows_response(rows))
     }
@@ -650,7 +650,7 @@ impl Connection {
                 let direction = order.unwrap_or(stmt::Direction::Asc);
 
                 if let Some(after) = after {
-                    let bound = keyset_after(table, &pk_columns, &after, direction);
+                    let bound = keyset_after(table, &pk_columns, &after, direction)?;
                     query = and_documents(query, bound);
                 }
 
@@ -668,7 +668,8 @@ impl Connection {
                 let next_cursor = (docs.len() as i64 == page_size)
                     .then(|| docs.last())
                     .flatten()
-                    .map(|doc| key_cursor(&pk_columns, doc));
+                    .map(|doc| key_cursor(&pk_columns, doc))
+                    .transpose()?;
 
                 Ok((docs, next_cursor))
             }
@@ -681,17 +682,15 @@ impl Connection {
 fn document_to_record<'a>(
     document: &Document,
     columns: impl Iterator<Item = &'a Column>,
-) -> stmt::Value {
-    let record = stmt::ValueRecord::from_vec(
-        columns
-            .map(|column| match document.get(&column.name) {
-                Some(bson) => Value::from_bson(&column.ty, bson),
-                None => stmt::Value::Null,
-            })
-            .collect(),
-    );
+) -> Result<stmt::Value> {
+    let fields = columns
+        .map(|column| match document.get(&column.name) {
+            Some(bson) => Value::from_bson(&column.ty, bson),
+            None => Ok(stmt::Value::Null),
+        })
+        .collect::<Result<_>>()?;
 
-    stmt::Value::from(record)
+    Ok(stmt::Value::from(stmt::ValueRecord::from_vec(fields)))
 }
 
 /// Extracts the field of a primary-key value that corresponds to a single key
@@ -749,7 +748,7 @@ fn keyset_after(
     pk_columns: &[&Column],
     key: &stmt::Value,
     direction: stmt::Direction,
-) -> Document {
+) -> Result<Document> {
     let cmp = match direction {
         stmt::Direction::Asc => "$gt",
         stmt::Direction::Desc => "$lt",
@@ -762,11 +761,11 @@ fn keyset_after(
         let mut branch = Document::new();
         // Equality on every earlier key column.
         for earlier in &pk_columns[..i] {
-            branch.insert(earlier.name.clone(), field_bson(earlier));
+            branch.insert(earlier.name.clone(), field_bson(earlier)?);
         }
         // Strict comparison on this column.
         let mut cmp_doc = Document::new();
-        cmp_doc.insert(cmp, field_bson(column));
+        cmp_doc.insert(cmp, field_bson(column)?);
         branch.insert(column.name.clone(), cmp_doc);
         branches.push(Bson::Document(branch));
     }
@@ -775,29 +774,31 @@ fn keyset_after(
         let Bson::Document(branch) = branches.remove(0) else {
             unreachable!()
         };
-        return branch;
+        return Ok(branch);
     }
 
     let mut doc = Document::new();
     doc.insert("$or", branches);
-    doc
+    Ok(doc)
 }
 
 /// Builds the cursor value for the last row of a page: the row's primary key —
 /// a scalar for single-column keys, a record for composite keys.
-fn key_cursor(pk_columns: &[&Column], doc: &Document) -> stmt::Value {
+fn key_cursor(pk_columns: &[&Column], doc: &Document) -> Result<stmt::Value> {
     let field = |column: &Column| match doc.get(&column.name) {
         Some(bson) => Value::from_bson(&column.ty, bson),
-        None => stmt::Value::Null,
+        None => Ok(stmt::Value::Null),
     };
 
     if let [pk] = pk_columns {
         return field(pk);
     }
 
-    stmt::Value::from(stmt::ValueRecord::from_vec(
-        pk_columns.iter().map(|column| field(column)).collect(),
-    ))
+    let fields = pk_columns
+        .iter()
+        .map(|column| field(column))
+        .collect::<Result<_>>()?;
+    Ok(stmt::Value::from(stmt::ValueRecord::from_vec(fields)))
 }
 
 /// Builds a filter selecting rows by primary key.
@@ -808,44 +809,46 @@ fn key_cursor(pk_columns: &[&Column], doc: &Document) -> stmt::Value {
 /// - Single-column key: `{ pk_col: { $in: [...] } }`.
 /// - Composite key: `{ $or: [ { c1: v1, c2: v2 }, ... ] }` — one equality
 ///   document per key tuple. A single key collapses to the bare document.
-fn pk_in_filter(table: &db::Table, pk_columns: &[&Column], keys: &[stmt::Value]) -> Document {
+fn pk_in_filter(
+    table: &db::Table,
+    pk_columns: &[&Column],
+    keys: &[stmt::Value],
+) -> Result<Document> {
     if let [pk_column] = pk_columns {
         let key_values: Vec<Bson> = keys
             .iter()
             .map(|key| Value::from(pk_field(table, pk_column, key).clone()).to_bson())
-            .collect();
+            .collect::<Result<_>>()?;
 
         let mut in_clause = Document::new();
         in_clause.insert("$in", key_values);
         let mut query = Document::new();
         query.insert(pk_column.name.clone(), in_clause);
-        return query;
+        return Ok(query);
     }
 
-    let mut branches: Vec<Bson> = keys
-        .iter()
-        .map(|key| {
-            let mut branch = Document::new();
-            for column in pk_columns {
-                branch.insert(
-                    column.name.clone(),
-                    Value::from(pk_field(table, column, key).clone()).to_bson(),
-                );
-            }
-            Bson::Document(branch)
-        })
-        .collect();
+    let mut branches: Vec<Bson> = Vec::with_capacity(keys.len());
+    for key in keys {
+        let mut branch = Document::new();
+        for column in pk_columns {
+            branch.insert(
+                column.name.clone(),
+                Value::from(pk_field(table, column, key).clone()).to_bson()?,
+            );
+        }
+        branches.push(Bson::Document(branch));
+    }
 
     if branches.len() == 1 {
         let Bson::Document(branch) = branches.remove(0) else {
             unreachable!()
         };
-        return branch;
+        return Ok(branch);
     }
 
     let mut query = Document::new();
     query.insert("$or", branches);
-    query
+    Ok(query)
 }
 
 /// Translates a set of column assignments into a MongoDB update document.
@@ -887,16 +890,16 @@ fn build_update_doc(table: &db::Table, assignments: &stmt::Assignments) -> Resul
                 unset.insert(name, "");
             }
             stmt::Assignment::Set(_) => {
-                set.insert(name, Value::from(value.clone()).to_bson());
+                set.insert(name, Value::from(value.clone()).to_bson()?);
             }
             stmt::Assignment::Add(_) => {
-                inc.insert(name, Value::from(value.clone()).to_bson());
+                inc.insert(name, Value::from(value.clone()).to_bson()?);
             }
             stmt::Assignment::Subtract(_) => {
-                inc.insert(name, negate_bson(Value::from(value.clone()).to_bson()));
+                inc.insert(name, negate_bson(Value::from(value.clone()).to_bson()?));
             }
             stmt::Assignment::Append(_) => {
-                let items = match Value::from(value.clone()).to_bson() {
+                let items = match Value::from(value.clone()).to_bson()? {
                     Bson::Array(items) => items,
                     other => vec![other],
                 };

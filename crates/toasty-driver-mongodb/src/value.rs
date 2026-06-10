@@ -10,9 +10,15 @@
 //! * Temporal and decimal types arrive pre-encoded as strings via the
 //!   [`StorageTypes`](toasty_core::driver::StorageTypes) mapping, so they need
 //!   no special handling here.
+//!
+//! A value or BSON shape outside the supported set returns
+//! [`Error::unsupported_feature`] rather than panicking.
 
 use mongodb::bson::{Bson, spec::BinarySubtype};
-use toasty_core::stmt::{self, Value as CoreValue};
+use toasty_core::{
+    Error, Result,
+    stmt::{self, Value as CoreValue},
+};
 
 /// Wraps a Toasty value for conversion to and from BSON.
 #[derive(Debug)]
@@ -26,12 +32,12 @@ impl From<CoreValue> for Value {
 
 impl Value {
     /// Converts a Toasty value into a BSON value for storage or filtering.
-    pub fn to_bson(&self) -> Bson {
+    pub fn to_bson(&self) -> Result<Bson> {
         Self::value_to_bson(&self.0)
     }
 
-    fn value_to_bson(value: &CoreValue) -> Bson {
-        match value {
+    fn value_to_bson(value: &CoreValue) -> Result<Bson> {
+        Ok(match value {
             stmt::Value::Bool(val) => Bson::Boolean(*val),
             stmt::Value::String(val) => Bson::String(val.clone()),
             stmt::Value::I8(val) => Bson::Int32(*val as i32),
@@ -56,53 +62,70 @@ impl Value {
                 subtype: BinarySubtype::Generic,
                 bytes: val.clone(),
             }),
-            stmt::Value::List(vals) => Bson::Array(vals.iter().map(Self::value_to_bson).collect()),
+            stmt::Value::List(vals) => Bson::Array(
+                vals.iter()
+                    .map(Self::value_to_bson)
+                    .collect::<Result<_>>()?,
+            ),
             stmt::Value::Null => Bson::Null,
-            _ => todo!("unsupported value -> bson: {:#?}", value),
-        }
+            _ => {
+                return Err(Error::unsupported_feature(format!(
+                    "the MongoDB driver cannot encode this value to BSON: {value:#?}"
+                )));
+            }
+        })
     }
 
     /// Converts a BSON value back into a Toasty value of the given type.
-    pub fn from_bson(ty: &stmt::Type, val: &Bson) -> CoreValue {
+    pub fn from_bson(ty: &stmt::Type, val: &Bson) -> Result<CoreValue> {
         use stmt::Type;
 
-        match (ty, val) {
+        Ok(match (ty, val) {
             (_, Bson::Null) => stmt::Value::Null,
             (Type::Bool, Bson::Boolean(val)) => stmt::Value::from(*val),
             (Type::String, Bson::String(val)) => stmt::Value::from(val.clone()),
-            (Type::I8, b) => stmt::Value::from(bson_as_i64(b) as i8),
-            (Type::I16, b) => stmt::Value::from(bson_as_i64(b) as i16),
-            (Type::I32, b) => stmt::Value::from(bson_as_i64(b) as i32),
-            (Type::I64, b) => stmt::Value::from(bson_as_i64(b)),
-            (Type::U8, b) => stmt::Value::from(bson_as_i64(b) as u8),
-            (Type::U16, b) => stmt::Value::from(bson_as_i64(b) as u16),
-            (Type::U32, b) => stmt::Value::from(bson_as_i64(b) as u32),
-            (Type::U64, b) => stmt::Value::from(bson_as_i64(b) as u64),
+            (Type::I8, b) => stmt::Value::from(bson_as_i64(b)? as i8),
+            (Type::I16, b) => stmt::Value::from(bson_as_i64(b)? as i16),
+            (Type::I32, b) => stmt::Value::from(bson_as_i64(b)? as i32),
+            (Type::I64, b) => stmt::Value::from(bson_as_i64(b)?),
+            (Type::U8, b) => stmt::Value::from(bson_as_i64(b)? as u8),
+            (Type::U16, b) => stmt::Value::from(bson_as_i64(b)? as u16),
+            (Type::U32, b) => stmt::Value::from(bson_as_i64(b)? as u32),
+            (Type::U64, b) => stmt::Value::from(bson_as_i64(b)? as u64),
             (Type::F32, Bson::Double(val)) => stmt::Value::from(*val as f32),
             (Type::F64, Bson::Double(val)) => stmt::Value::from(*val),
-            (Type::Uuid, Bson::String(val)) => {
-                stmt::Value::from(val.parse::<uuid::Uuid>().expect("invalid uuid string"))
-            }
+            (Type::Uuid, Bson::String(val)) => stmt::Value::from(
+                val.parse::<uuid::Uuid>()
+                    .map_err(Error::driver_operation_failed)?,
+            ),
             (Type::Bytes, Bson::Binary(bin)) => stmt::Value::Bytes(bin.bytes.clone()),
             (Type::List(elem), Bson::Array(items)) => stmt::Value::List(
                 items
                     .iter()
                     .map(|item| Self::from_bson(elem, item))
-                    .collect(),
+                    .collect::<Result<_>>()?,
             ),
-            _ => todo!("unsupported bson -> value: ty={ty:#?}; value={val:#?}"),
-        }
+            _ => {
+                return Err(Error::unsupported_feature(format!(
+                    "the MongoDB driver cannot decode this BSON to a value: ty={ty:#?}; value={val:#?}"
+                )));
+            }
+        })
     }
 }
 
 /// Coerces any BSON numeric variant into an `i64`. MongoDB may return an
 /// integer field as `Int32`, `Int64`, or `Double` depending on how it was
 /// written, so narrow-integer columns accept all three.
-fn bson_as_i64(b: &Bson) -> i64 {
-    match b {
+fn bson_as_i64(b: &Bson) -> Result<i64> {
+    Ok(match b {
         Bson::Int32(v) => *v as i64,
         Bson::Int64(v) => *v,
         Bson::Double(v) => *v as i64,
-        _ => todo!("expected numeric bson, got {b:#?}"),
-    }
+        _ => {
+            return Err(Error::unsupported_feature(format!(
+                "the MongoDB driver expected a numeric BSON value, got {b:#?}"
+            )));
+        }
+    })
 }

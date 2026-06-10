@@ -244,7 +244,7 @@ fn field_name(cx: &ExprContext<'_, db::Schema>, expr: &stmt::Expr) -> Result<Str
 /// Converts a literal value expression into a BSON value.
 fn expr_to_bson(expr: &stmt::Expr) -> Result<Bson> {
     match expr {
-        stmt::Expr::Value(value) => Ok(Value::from(value.clone()).to_bson()),
+        stmt::Expr::Value(value) => Value::from(value.clone()).to_bson(),
         _ => Err(Error::unsupported_feature(format!(
             "the MongoDB driver expected a literal value, got {expr:#?}"
         ))),
