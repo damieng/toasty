@@ -10,7 +10,9 @@ Run the suite with:
 cargo test -p tests --features mongodb --no-default-features -- --test-threads=1
 ```
 
-Current baseline: **546 passing, 20 failing** (out of 566 in the suite).
+Current baseline: **563 passing, 3 failing** (out of 566 in the suite). The 3
+remaining are DynamoDB-specific test expectations that do not apply to MongoDB;
+see category 10.
 
 ---
 
@@ -106,15 +108,10 @@ The `InList` arm also drops null operands from `$in`: a NULL in a SQL `IN`
 list matches nothing, whereas `{ field: { $in: [v, null] } }` would match
 missing/null documents.
 
-Two non-SQL tests assert DynamoDB-specific errors that do not apply to
-MongoDB (which handles the input natively): `starts_with::starts_with_empty_prefix`
-(empty prefix matches all, like SQL `LIKE '%'`) and category 9's composite
-unique index. They need a capability flag or test gate, not a driver change.
-
-Still pending: `LEN(array) = n` (`type_collection::vec_string_len_filter`)
-arrives as `ExprBinaryOp` with an `ExprLength` operand and hits the
-"binary op without a column reference" `todo!`. It maps to
-`{ field: { $size: n } }`.
+`LEN(array) <op> n` (`type_collection::vec_string_len_filter`) arrives as
+`ExprBinaryOp` with an `ExprLength` operand: equality maps to
+`{ field: { $size: n } }`, other comparisons to
+`{ $expr: { <op>: [ { $size: "$field" }, n ] } }`.
 
 ---
 
@@ -149,6 +146,49 @@ bound; see category 4.
 | `crates/toasty-core/src/stmt/expr_*.rs` | AST definitions for filter expressions |
 | `tests/tests/mongodb.rs` | Test entry point wiring the suite to the MongoDB driver |
 
+### 7. Optimistic-lock conditions (FIXED)
+
+`op.condition` (e.g. a `#[version]` check) must error on a present row that
+fails it, not silently skip it. `exec_update_by_key` / `exec_delete_by_key`
+apply the conditioned write, then compare its matched/deleted count against the
+number of rows the key/filter selects; a shortfall returns `condition_failed`.
+The update returning path uses a per-key `find_one_and_update`, falling back to
+a key/filter count on a miss to tell a stale lock from an absent row.
+
+---
+
+### 8. Array length filter (FIXED)
+
+`LEN(array) <op> n` — equality uses `{ field: { $size: n } }`, other
+comparisons `{ $expr: { <op>: [ { $size: "$field" }, n ] } }`. See category 5.
+
+---
+
+### 9. Unique index on nullable columns (FIXED)
+
+`push_schema` creates a unique index on a nullable column as sparse, so a
+second document with the field absent (how `exec_insert` stores null) is
+allowed, matching SQL's "multiple NULLs". See `push_schema`.
+
+---
+
+### 10. DynamoDB-specific test expectations (won't fix in the driver)
+
+Three suite tests gated `requires(not(sql))` assert DynamoDB-specific errors
+that do not apply to MongoDB, which handles the input natively. These are not
+driver bugs; resolving them needs a capability flag or test gate, not a driver
+change:
+
+- `starts_with::starts_with_empty_prefix` — DynamoDB's `begins_with` rejects an
+  empty prefix; MongoDB matches all rows (like SQL `LIKE '%'`).
+- `index_composite::composite_unique_index_unsupported_on_dynamodb` — MongoDB
+  supports composite unique indexes natively, so `setup_db` succeeds.
+- `index_composite::composite_index_too_many_range_columns` — DynamoDB limits a
+  key index to 4 range columns; MongoDB has no such limit, so `setup_db`
+  succeeds.
+
+---
+
 ## Suggested implementation order
 
 1. ~~**Primary-key `Value::Record` flattening**~~ — done; see category 1.
@@ -157,7 +197,7 @@ bound; see category 4.
 4. ~~**Pagination**~~ — done; see category 6.
 5. ~~**Filter expressions**~~ — done (`ExprNot`, `ExprStartsWith`, `ExprBetween`, `ExprAnyOp`, `InList`-with-null); see category 5.
 6. ~~**Composite primary keys**~~ — done; see category 4.
-7. **Optimistic-lock conditions** — 14 tests (`update`/`delete` conditions); needs to distinguish a filtered-out row from a condition failure.
-8. **`LEN(array)` filter** — 1 test (`vec_string_len_filter`). `ExprBinaryOp` with an `ExprLength` operand maps to `{ field: { $size: n } }`.
-9. **Unique index on nullable columns** — 2–3 tests. `exec_insert` omits null fields, and a plain MongoDB unique index rejects a second missing/null value (`E11000`, on insert and update). SQL allows multiple NULLs; `push_schema` should create unique indexes on nullable columns as sparse (or partial on existence).
-10. **Composite unique indexes** — 1 test. MongoDB supports them natively, so `push_schema` succeeds, but `composite_unique_index_unsupported_on_dynamodb` asserts a DynamoDB-specific `unsupported_feature` error. Needs a capability flag or a test gate rather than a driver change.
+7. ~~**Optimistic-lock conditions**~~ — done; see category 7.
+8. ~~**Array length filter**~~ — done; see category 8.
+9. ~~**Unique index on nullable columns**~~ — done; see category 9.
+10. **DynamoDB-specific test expectations** — 3 tests; not driver bugs. See category 10.
