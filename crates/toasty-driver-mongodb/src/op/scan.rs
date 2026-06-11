@@ -12,7 +12,7 @@ use crate::{Connection, document_to_record, filter, paginated_response};
 
 impl Connection {
     pub(crate) async fn exec_scan(
-        &self,
+        &mut self,
         schema: &Arc<Schema>,
         op: operation::Scan,
     ) -> Result<ExecResponse> {

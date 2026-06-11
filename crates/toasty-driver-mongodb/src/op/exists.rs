@@ -16,7 +16,7 @@ pub(crate) enum ExistsOutcome {
 /// `count_documents`. Returns `ShortCircuit` as soon as one EXISTS returns 0.
 /// The remainder of the filter (non-EXISTS parts) is returned via `Proceed`.
 pub(crate) async fn evaluate(
-    conn: &Connection,
+    conn: &mut Connection,
     schema: &Arc<Schema>,
     filter: &stmt::Expr,
 ) -> Result<ExistsOutcome> {
@@ -53,9 +53,10 @@ pub(crate) async fn evaluate(
     }
 }
 
-/// Runs `count_documents` against the table named by the EXISTS subquery.
+/// Runs `count_documents` against the table named by the EXISTS subquery,
+/// threading the active session (if any) through the operation.
 async fn check_one(
-    conn: &Connection,
+    conn: &mut Connection,
     schema: &Arc<Schema>,
     exists: &stmt::ExprExists,
 ) -> Result<bool> {
@@ -92,11 +93,19 @@ async fn check_one(
         .transpose()?
         .unwrap_or_default();
 
-    let count = conn
-        .collection(&table.name)
-        .count_documents(query)
-        .await
-        .map_err(toasty_core::Error::driver_operation_failed)?;
+    let collection = conn.collection(&table.name);
+    let count = if let Some(sess) = conn.session.as_mut() {
+        collection
+            .count_documents(query)
+            .session(sess)
+            .await
+            .map_err(toasty_core::Error::driver_operation_failed)?
+    } else {
+        collection
+            .count_documents(query)
+            .await
+            .map_err(toasty_core::Error::driver_operation_failed)?
+    };
 
     Ok(count > 0)
 }

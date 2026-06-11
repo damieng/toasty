@@ -12,7 +12,7 @@ use crate::{Connection, and_documents, document_to_record, filter, paginated_res
 
 impl Connection {
     pub(crate) async fn exec_query_pk(
-        &self,
+        &mut self,
         schema: &Arc<Schema>,
         op: operation::QueryPk,
     ) -> Result<ExecResponse> {

@@ -10,7 +10,7 @@ use crate::{Connection, document_to_record, pk_in_filter, rows_response};
 
 impl Connection {
     pub(crate) async fn exec_get_by_key(
-        &self,
+        &mut self,
         schema: &Arc<Schema>,
         op: operation::GetByKey,
     ) -> Result<ExecResponse> {

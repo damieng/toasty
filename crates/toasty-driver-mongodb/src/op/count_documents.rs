@@ -11,7 +11,7 @@ use crate::{Connection, filter};
 
 impl Connection {
     pub(crate) async fn exec_count_documents(
-        &self,
+        &mut self,
         schema: &Arc<Schema>,
         op: operation::CountDocuments,
     ) -> Result<ExecResponse> {
@@ -42,11 +42,19 @@ impl Connection {
             .transpose()?
             .unwrap_or_default();
 
-        let count = self
-            .collection(&table.name)
-            .count_documents(query)
-            .await
-            .map_err(toasty_core::Error::driver_operation_failed)?;
+        let collection = self.collection(&table.name);
+        let count = if let Some(sess) = self.session.as_mut() {
+            collection
+                .count_documents(query)
+                .session(sess)
+                .await
+                .map_err(toasty_core::Error::driver_operation_failed)?
+        } else {
+            collection
+                .count_documents(query)
+                .await
+                .map_err(toasty_core::Error::driver_operation_failed)?
+        };
 
         let row = stmt::Value::record_from_vec(vec![stmt::Value::U64(count)]);
         Ok(ExecResponse {

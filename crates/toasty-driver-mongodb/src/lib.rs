@@ -22,8 +22,9 @@
 //! [`GetByKey`](operation::GetByKey),
 //! [`UpdateByKey`](operation::UpdateByKey),
 //! [`DeleteByKey`](operation::DeleteByKey), and
-//! [`FindPkByIndex`](operation::FindPkByIndex). Transactions and migrations
-//! are not yet supported.
+//! [`FindPkByIndex`](operation::FindPkByIndex). Transactions are supported
+//! when the backing deployment is a replica set or sharded cluster; savepoints
+//! (used by the interactive `db.transaction()` API) are not yet implemented.
 
 mod filter;
 mod op;
@@ -33,14 +34,17 @@ pub(crate) use value::Value;
 
 use async_trait::async_trait;
 use mongodb::{
-    Client, Collection, Database, IndexModel,
+    Client, ClientSession, Collection, Database, IndexModel,
     bson::{Bson, Document},
     options::IndexOptions,
 };
 use std::{borrow::Cow, sync::Arc};
 use toasty_core::{
     Error, Result, Schema,
-    driver::{Capability, Driver, ExecResponse, Rows, operation, operation::Operation},
+    driver::{
+        Capability, Driver, ExecResponse, Rows, operation,
+        operation::{Operation, Transaction, TransactionMode},
+    },
     schema::{
         db::{self, Column},
         diff,
@@ -120,6 +124,8 @@ impl Driver for MongoDb {
         // manages its own connection pool internally.
         Ok(Box::new(Connection {
             database: self.database(),
+            client: self.client.clone(),
+            session: None,
         }))
     }
 
@@ -142,6 +148,10 @@ impl Driver for MongoDb {
 #[derive(Debug)]
 pub struct Connection {
     database: Database,
+    /// Used to start new sessions for multi-document transactions.
+    client: Client,
+    /// Active session when a multi-document transaction is in progress.
+    session: Option<ClientSession>,
 }
 
 impl Connection {
@@ -176,9 +186,7 @@ impl toasty_core::driver::Connection for Connection {
             Operation::RawSql(_) => Err(Error::unsupported_feature(
                 "raw SQL is only supported by SQL drivers",
             )),
-            Operation::Transaction(_) => Err(Error::unsupported_feature(
-                "transactions are not yet supported by the MongoDB driver",
-            )),
+            Operation::Transaction(op) => self.exec_transaction(op).await,
         }
     }
 
@@ -254,15 +262,66 @@ impl toasty_core::driver::Connection for Connection {
 }
 
 impl Connection {
+    async fn exec_transaction(&mut self, op: Transaction) -> Result<ExecResponse> {
+        match op {
+            Transaction::Start { mode, .. } => {
+                // Only the driver's default locking mode is meaningful for
+                // MongoDB; SQLite-specific modes (Immediate, Exclusive) are
+                // rejected.
+                if !matches!(mode, TransactionMode::Default) {
+                    return Err(Error::unsupported_feature(
+                        "the MongoDB driver only supports TransactionMode::Default",
+                    ));
+                }
+                let mut session = self
+                    .client
+                    .start_session()
+                    .await
+                    .map_err(Error::driver_operation_failed)?;
+                session
+                    .start_transaction()
+                    .await
+                    .map_err(Error::driver_operation_failed)?;
+                self.session = Some(session);
+            }
+            Transaction::Commit => {
+                if let Some(sess) = &mut self.session {
+                    sess.commit_transaction()
+                        .await
+                        .map_err(Error::driver_operation_failed)?;
+                }
+                self.session = None;
+            }
+            Transaction::Rollback => {
+                if let Some(sess) = &mut self.session {
+                    sess.abort_transaction()
+                        .await
+                        .map_err(Error::driver_operation_failed)?;
+                }
+                self.session = None;
+            }
+            Transaction::Savepoint(_)
+            | Transaction::ReleaseSavepoint(_)
+            | Transaction::RollbackToSavepoint(_) => {
+                return Err(Error::unsupported_feature(
+                    "the MongoDB driver does not support savepoints; \
+                     the interactive db.transaction() API is not yet supported",
+                ));
+            }
+        }
+        Ok(ExecResponse::count(0))
+    }
+
     /// Runs a `find` with the given filter and collects all matching documents.
-    async fn find(&self, collection: &str, query: Document) -> Result<Vec<Document>> {
+    async fn find(&mut self, collection: &str, query: Document) -> Result<Vec<Document>> {
         self.run_find(collection, query, None, None, None).await
     }
 
     /// Runs a `find` with optional sort, skip, and limit, collecting the
-    /// matching documents.
+    /// matching documents. Threads the active session (if any) through
+    /// the cursor.
     async fn run_find(
-        &self,
+        &mut self,
         collection: &str,
         query: Document,
         sort: Option<Document>,
@@ -272,33 +331,7 @@ impl Connection {
         tracing::trace!(collection, ?query, ?sort, ?skip, ?limit, "find");
 
         let coll = self.collection(collection);
-        let mut find = coll.find(query);
-        if let Some(sort) = sort {
-            find = find.sort(sort);
-        }
-        if let Some(skip) = skip {
-            find = find.skip(skip);
-        }
-        if let Some(limit) = limit {
-            find = find.limit(limit);
-        }
-
-        let mut cursor = find.await.map_err(Error::driver_operation_failed)?;
-
-        let mut documents = Vec::new();
-        while cursor
-            .advance()
-            .await
-            .map_err(Error::driver_operation_failed)?
-        {
-            documents.push(
-                cursor
-                    .deserialize_current()
-                    .map_err(Error::driver_operation_failed)?,
-            );
-        }
-
-        Ok(documents)
+        run_find_impl(coll, query, sort, skip, limit, self.session.as_mut()).await
     }
 
     /// Runs a query with pagination, returning the matching documents and, for
@@ -308,7 +341,7 @@ impl Connection {
     /// applied by the engine before the limit is pushed down, so it never
     /// reaches the driver.
     async fn find_paginated(
-        &self,
+        &mut self,
         table: &db::Table,
         mut query: Document,
         limit: Option<operation::Pagination>,
@@ -353,9 +386,16 @@ impl Connection {
                     sort.insert(column.name.clone(), sort_value);
                 }
 
-                let docs = self
-                    .run_find(&table.name, query, Some(sort), None, Some(page_size))
-                    .await?;
+                let coll = self.collection(&table.name);
+                let docs = run_find_impl(
+                    coll,
+                    query,
+                    Some(sort),
+                    None,
+                    Some(page_size),
+                    self.session.as_mut(),
+                )
+                .await?;
 
                 // A full page may have a successor; a short page is the last.
                 let next_cursor = (docs.len() as i64 == page_size)
@@ -367,6 +407,73 @@ impl Connection {
                 Ok((docs, next_cursor))
             }
         }
+    }
+}
+
+/// Collects documents from a `find` into a `Vec`, sharing the active session
+/// (if any) with the cursor. Returns two code paths because `Cursor` and
+/// `SessionCursor` have incompatible iteration APIs in the `mongodb` crate.
+async fn run_find_impl(
+    coll: Collection<Document>,
+    query: Document,
+    sort: Option<Document>,
+    skip: Option<u64>,
+    limit: Option<i64>,
+    session: Option<&mut ClientSession>,
+) -> Result<Vec<Document>> {
+    if let Some(sess) = session {
+        let mut find = coll.find(query);
+        if let Some(s) = sort {
+            find = find.sort(s);
+        }
+        if let Some(sk) = skip {
+            find = find.skip(sk);
+        }
+        if let Some(l) = limit {
+            find = find.limit(l);
+        }
+        let mut cursor = find
+            .session(&mut *sess)
+            .await
+            .map_err(Error::driver_operation_failed)?;
+        let mut documents = Vec::new();
+        while cursor
+            .advance(sess)
+            .await
+            .map_err(Error::driver_operation_failed)?
+        {
+            documents.push(
+                cursor
+                    .deserialize_current()
+                    .map_err(Error::driver_operation_failed)?,
+            );
+        }
+        Ok(documents)
+    } else {
+        let mut find = coll.find(query);
+        if let Some(s) = sort {
+            find = find.sort(s);
+        }
+        if let Some(sk) = skip {
+            find = find.skip(sk);
+        }
+        if let Some(l) = limit {
+            find = find.limit(l);
+        }
+        let mut cursor = find.await.map_err(Error::driver_operation_failed)?;
+        let mut documents = Vec::new();
+        while cursor
+            .advance()
+            .await
+            .map_err(Error::driver_operation_failed)?
+        {
+            documents.push(
+                cursor
+                    .deserialize_current()
+                    .map_err(Error::driver_operation_failed)?,
+            );
+        }
+        Ok(documents)
     }
 }
 

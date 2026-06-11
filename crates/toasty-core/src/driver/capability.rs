@@ -893,7 +893,7 @@ impl Capability {
         native_count: true,
         native_join: false, // future: $lookup aggregation pipeline
         native_exists: true,
-        use_transactions: false, // future: replica-set transactions
+        use_transactions: true,
         ..Self::DYNAMODB
     };
 }

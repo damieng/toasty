@@ -16,7 +16,7 @@ use crate::{
 
 impl Connection {
     pub(crate) async fn exec_update_by_key(
-        &self,
+        &mut self,
         schema: &Arc<Schema>,
         op: operation::UpdateByKey,
     ) -> Result<ExecResponse> {
@@ -68,19 +68,36 @@ impl Connection {
                 // When a condition is present, count the selected rows first so
                 // a shortfall after the conditioned update signals a stale lock.
                 let present = match &op.condition {
-                    Some(_) => Some(
-                        collection
-                            .count_documents(base.clone())
-                            .await
-                            .map_err(Error::driver_operation_failed)?,
-                    ),
+                    Some(_) => {
+                        let count = if let Some(sess) = self.session.as_mut() {
+                            collection
+                                .count_documents(base.clone())
+                                .session(sess)
+                                .await
+                                .map_err(Error::driver_operation_failed)?
+                        } else {
+                            collection
+                                .count_documents(base.clone())
+                                .await
+                                .map_err(Error::driver_operation_failed)?
+                        };
+                        Some(count)
+                    }
                     None => None,
                 };
 
-                let result = collection
-                    .update_many(with_condition(base)?, update)
-                    .await
-                    .map_err(Error::driver_operation_failed)?;
+                let result = if let Some(sess) = self.session.as_mut() {
+                    collection
+                        .update_many(with_condition(base)?, update)
+                        .session(sess)
+                        .await
+                        .map_err(Error::driver_operation_failed)?
+                } else {
+                    collection
+                        .update_many(with_condition(base)?, update)
+                        .await
+                        .map_err(Error::driver_operation_failed)?
+                };
 
                 if let Some(present) = present
                     && result.matched_count < present
@@ -104,11 +121,20 @@ impl Connection {
                 for key in &op.keys {
                     let base = base_filter(std::slice::from_ref(key))?;
 
-                    let updated = collection
-                        .find_one_and_update(with_condition(base.clone())?, update.clone())
-                        .return_document(ReturnDocument::After)
-                        .await
-                        .map_err(Error::driver_operation_failed)?;
+                    let updated = if let Some(sess) = self.session.as_mut() {
+                        collection
+                            .find_one_and_update(with_condition(base.clone())?, update.clone())
+                            .return_document(ReturnDocument::After)
+                            .session(sess)
+                            .await
+                            .map_err(Error::driver_operation_failed)?
+                    } else {
+                        collection
+                            .find_one_and_update(with_condition(base.clone())?, update.clone())
+                            .return_document(ReturnDocument::After)
+                            .await
+                            .map_err(Error::driver_operation_failed)?
+                    };
 
                     match updated {
                         Some(doc) => rows.push(document_to_record(&doc, columns.iter().copied())?),
@@ -116,10 +142,18 @@ impl Connection {
                         // means the condition failed (stale lock); otherwise the
                         // row was absent or filtered out.
                         None if op.condition.is_some() => {
-                            let present = collection
-                                .count_documents(base)
-                                .await
-                                .map_err(Error::driver_operation_failed)?;
+                            let present = if let Some(sess) = self.session.as_mut() {
+                                collection
+                                    .count_documents(base)
+                                    .session(sess)
+                                    .await
+                                    .map_err(Error::driver_operation_failed)?
+                            } else {
+                                collection
+                                    .count_documents(base)
+                                    .await
+                                    .map_err(Error::driver_operation_failed)?
+                            };
                             if present > 0 {
                                 return Err(Error::condition_failed(
                                     "update condition not met (stale optimistic-lock version)",

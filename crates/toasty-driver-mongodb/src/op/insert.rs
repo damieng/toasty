@@ -5,7 +5,7 @@ use crate::{Connection, Value, pk_field};
 
 impl Connection {
     pub(crate) async fn exec_insert(
-        &self,
+        &mut self,
         schema: &db::Schema,
         insert: stmt::Insert,
     ) -> Result<ExecResponse> {
@@ -48,10 +48,18 @@ impl Connection {
         let count = documents.len();
 
         if !documents.is_empty() {
-            collection
-                .insert_many(documents)
-                .await
-                .map_err(Error::driver_operation_failed)?;
+            if let Some(sess) = self.session.as_mut() {
+                collection
+                    .insert_many(documents)
+                    .session(sess)
+                    .await
+                    .map_err(Error::driver_operation_failed)?;
+            } else {
+                collection
+                    .insert_many(documents)
+                    .await
+                    .map_err(Error::driver_operation_failed)?;
+            }
         }
 
         Ok(ExecResponse::count(count as u64))

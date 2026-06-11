@@ -12,7 +12,7 @@ use crate::{Connection, and_documents, filter, pk_in_filter};
 
 impl Connection {
     pub(crate) async fn exec_delete_by_key(
-        &self,
+        &mut self,
         schema: &Arc<Schema>,
         op: operation::DeleteByKey,
     ) -> Result<ExecResponse> {
@@ -27,8 +27,6 @@ impl Connection {
             None
         };
 
-        // MongoDB enforces unique indexes natively, so no secondary index
-        // maintenance is needed (unlike the DynamoDB driver).
         let table = schema.db.table(op.table);
         let pk_columns: Vec<&Column> = table.primary_key_columns().collect();
         let cx = ExprContext::new_with_target(&schema.db, table);
@@ -41,10 +39,18 @@ impl Connection {
         let collection = self.collection(&table.name);
 
         let Some(condition) = &op.condition else {
-            let result = collection
-                .delete_many(base)
-                .await
-                .map_err(Error::driver_operation_failed)?;
+            let result = if let Some(sess) = self.session.as_mut() {
+                collection
+                    .delete_many(base)
+                    .session(sess)
+                    .await
+                    .map_err(Error::driver_operation_failed)?
+            } else {
+                collection
+                    .delete_many(base)
+                    .await
+                    .map_err(Error::driver_operation_failed)?
+            };
             return Ok(ExecResponse::count(result.deleted_count));
         };
 
@@ -52,16 +58,32 @@ impl Connection {
         // an error, not a silent no-op. Count the rows the key/filter selects,
         // then delete only those that also satisfy the condition; a shortfall
         // means the condition failed.
-        let present = collection
-            .count_documents(base.clone())
-            .await
-            .map_err(Error::driver_operation_failed)?;
+        let present = if let Some(sess) = self.session.as_mut() {
+            collection
+                .count_documents(base.clone())
+                .session(sess)
+                .await
+                .map_err(Error::driver_operation_failed)?
+        } else {
+            collection
+                .count_documents(base.clone())
+                .await
+                .map_err(Error::driver_operation_failed)?
+        };
 
         let query = and_documents(base, filter::translate_filter(&cx, condition)?);
-        let result = collection
-            .delete_many(query)
-            .await
-            .map_err(Error::driver_operation_failed)?;
+        let result = if let Some(sess) = self.session.as_mut() {
+            collection
+                .delete_many(query)
+                .session(sess)
+                .await
+                .map_err(Error::driver_operation_failed)?
+        } else {
+            collection
+                .delete_many(query)
+                .await
+                .map_err(Error::driver_operation_failed)?
+        };
 
         if result.deleted_count < present {
             return Err(Error::condition_failed(

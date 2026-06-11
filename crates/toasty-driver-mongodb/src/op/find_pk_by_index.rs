@@ -11,7 +11,7 @@ use crate::{Connection, document_to_record, filter, rows_response};
 
 impl Connection {
     pub(crate) async fn exec_find_pk_by_index(
-        &self,
+        &mut self,
         schema: &Arc<Schema>,
         op: operation::FindPkByIndex,
     ) -> Result<ExecResponse> {
