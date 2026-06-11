@@ -1,11 +1,14 @@
 use crate::engine::exec::{
-    DeleteByKey, Eval, ExecStatement, Filter, FindPkByIndex, GetByKey, Guard, NestedMerge, Project,
-    QueryPk, ReadModifyWrite, Scan, SetVar, UpdateByKey,
+    CountDocuments, DeleteByKey, Eval, ExecStatement, Filter, FindPkByIndex, GetByKey, Guard,
+    NestedMerge, Project, QueryPk, ReadModifyWrite, Scan, SetVar, UpdateByKey,
 };
 
 use std::fmt;
 
 pub(crate) enum Action {
+    /// Count documents matching a filter
+    CountDocuments(CountDocuments),
+
     /// Delete a record by the primary key
     DeleteByKey(DeleteByKey),
 
@@ -57,6 +60,7 @@ impl Action {
     /// Returns the action variant name for logging.
     pub(crate) fn name(&self) -> &'static str {
         match self {
+            Action::CountDocuments(_) => "count_documents",
             Action::DeleteByKey(_) => "delete_by_key",
             Action::Eval(_) => "eval",
             Action::ExecStatement(_) => "exec_statement",
@@ -80,7 +84,8 @@ impl Action {
     /// In-memory actions (Filter, Project, NestedMerge, SetVar, Eval) return false.
     pub(crate) fn is_db_op(&self) -> bool {
         match self {
-            Action::DeleteByKey(_)
+            Action::CountDocuments(_)
+            | Action::DeleteByKey(_)
             | Action::ExecStatement(_)
             | Action::FindPkByIndex(_)
             | Action::GetByKey(_)
@@ -102,6 +107,7 @@ impl Action {
 impl fmt::Debug for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CountDocuments(a) => a.fmt(f),
             Self::DeleteByKey(a) => a.fmt(f),
             Self::Eval(a) => a.fmt(f),
             Self::ExecStatement(a) => a.fmt(f),

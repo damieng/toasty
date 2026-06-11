@@ -166,6 +166,7 @@ impl toasty_core::driver::Connection for Connection {
                     "the MongoDB driver does not support this statement: {other:#?}"
                 ))),
             },
+            Operation::CountDocuments(op) => self.exec_count_documents(schema, op).await,
             Operation::Scan(op) => self.exec_scan(schema, op).await,
             Operation::QueryPk(op) => self.exec_query_pk(schema, op).await,
             Operation::GetByKey(op) => self.exec_get_by_key(schema, op).await,

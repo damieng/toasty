@@ -742,12 +742,11 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
         stmt: stmt::Statement,
         returning: &mut Returning,
     ) -> Result<mir::NodeId> {
-        // COUNT(*) is SQL-only
         if self.load_data.select_items.contains(&SelectItem::CountStar)
-            && !self.planner.engine.capability().sql
+            && !self.planner.engine.capability().native_count
         {
             return Err(toasty_core::Error::unsupported_feature(
-                "count() queries are only supported with SQL drivers",
+                "count() queries require a driver with native aggregate count (`native_count`)",
             ));
         }
 
@@ -1237,6 +1236,12 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
             debug_assert!(self.load_data.select_items.is_empty());
         }
 
+        // COUNT(*) on a native-count driver: emit a single CountDocuments node
+        // instead of fetching rows and counting client-side.
+        if self.load_data.select_items.contains(&SelectItem::CountStar) {
+            return self.plan_count_documents_execution(stmt);
+        }
+
         // Without SQL capability, we have to plan the execution of the
         // statement based on available indices.
         let index_plan_opt = self.planner.engine.plan_index_path(&stmt)?;
@@ -1261,6 +1266,31 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
             let ty = self.infer_nosql_record_ty(&stmt);
             self.plan_scan_execution(stmt, ty)
         }
+    }
+
+    fn plan_count_documents_execution(&mut self, stmt: stmt::Statement) -> Result<mir::NodeId> {
+        let cx = stmt::ExprContext::new(&*self.planner.engine.schema);
+        let cx = cx.scope(&stmt);
+        let stmt::ExprTarget::Table(table) = cx.target() else {
+            return Err(toasty_core::Error::unsupported_feature(
+                "count: expected table target",
+            ));
+        };
+        let table_id = table.id;
+
+        let filter = {
+            let f = stmt.filter_expr_unwrap();
+            if f.is_true() { None } else { Some(f.clone()) }
+        };
+
+        // Return type: List([Record([U64])]) — one row, one column holding the count.
+        let ty = stmt::Type::list(stmt::Type::Record(vec![stmt::Type::U64]));
+
+        Ok(self.insert_mir_with_deps(mir::CountDocuments {
+            table: table_id,
+            filter,
+            ty,
+        }))
     }
 
     fn infer_nosql_record_ty(&self, stmt: &stmt::Statement) -> stmt::Type {

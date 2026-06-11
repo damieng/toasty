@@ -910,7 +910,7 @@ impl visit_mut::VisitMut for LowerStatement<'_, '_> {
                     self.curr_stmt_info().deps.insert(target_id);
                 }
             }
-            stmt::Expr::Exists(_) if !self.capability().sql => {
+            stmt::Expr::Exists(_) if !self.capability().native_exists => {
                 let stmt::Expr::Exists(mut expr_exists) = expr.take() else {
                     panic!()
                 };

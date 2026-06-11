@@ -49,7 +49,7 @@ impl Engine {
             logical_plan: &logical_plan,
             var_decls: VarDecls::default(),
             actions: vec![],
-            use_transactions: self.capability().sql,
+            use_transactions: self.capability().use_transactions,
         }
         .plan_execution()
     }

@@ -52,6 +52,28 @@ pub struct Capability {
     /// SQL: Mysql doesn't support returning clauses from insert / update queries
     pub returning_from_mutation: bool,
 
+    /// Whether the engine wraps multi-statement execution plans in a database
+    /// transaction. SQL drivers set this `true`. DynamoDB does not support
+    /// `Operation::Transaction` so it is `false`. MongoDB 4.0+ supports
+    /// multi-document transactions on replica sets, so MongoDB sets this `true`.
+    pub use_transactions: bool,
+
+    /// Whether the backend can answer a `COUNT(*)` aggregate query natively.
+    /// When `true`, the planner emits a count-star select; when `false`, the
+    /// engine rejects count queries with an `unsupported_feature` error.
+    pub native_count: bool,
+
+    /// Whether the backend can traverse multi-step (`via`) relations
+    /// server-side. SQL drivers handle this via `JOIN`; a document or key-value
+    /// driver would need cascading per-step queries (not yet implemented).
+    /// When `false`, schemas with `via` relations are rejected at build time.
+    pub native_join: bool,
+
+    /// Whether the backend evaluates `EXISTS` predicates natively. When
+    /// `false`, the lowering pass extracts the `EXISTS` subquery into a
+    /// separate sub-statement for in-memory evaluation by the executor.
+    pub native_exists: bool,
+
     /// DynamoDB does not support != predicates on the primary key.
     pub primary_key_ne_predicate: bool,
 
@@ -489,6 +511,29 @@ impl Capability {
             ));
         }
 
+        if self.sql {
+            if !self.use_transactions {
+                return Err(crate::Error::invalid_driver_configuration(
+                    "sql is true but use_transactions is false",
+                ));
+            }
+            if !self.native_count {
+                return Err(crate::Error::invalid_driver_configuration(
+                    "sql is true but native_count is false",
+                ));
+            }
+            if !self.native_join {
+                return Err(crate::Error::invalid_driver_configuration(
+                    "sql is true but native_join is false",
+                ));
+            }
+            if !self.native_exists {
+                return Err(crate::Error::invalid_driver_configuration(
+                    "sql is true but native_exists is false",
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -537,6 +582,10 @@ impl Capability {
         cte_with_update: false,
         select_for_update: false,
         returning_from_mutation: true,
+        use_transactions: true,
+        native_count: true,
+        native_join: true,
+        native_exists: true,
         primary_key_ne_predicate: true,
         auto_increment: true,
         max_auto_increment_integer_width: Some(4),
@@ -748,6 +797,10 @@ impl Capability {
         cte_with_update: false,
         select_for_update: false,
         returning_from_mutation: false,
+        use_transactions: false,
+        native_count: false,
+        native_join: false,
+        native_exists: false,
         primary_key_ne_predicate: false,
         auto_increment: false,
         max_auto_increment_integer_width: None,
@@ -836,7 +889,13 @@ impl Capability {
     /// * `scan_supports_sort`, `bool_key_type` — MongoDB could support both,
     ///   but no suite test gates on them and `scan_supports_sort: true` would
     ///   break the DynamoDB-shaped `scan_order_by_is_error` expectation.
-    pub const MONGODB: Self = Self { ..Self::DYNAMODB };
+    pub const MONGODB: Self = Self {
+        native_count: true,
+        native_join: false,      // future: $lookup aggregation pipeline
+        native_exists: false,    // future: $expr + $exists
+        use_transactions: false, // future: replica-set transactions
+        ..Self::DYNAMODB
+    };
 }
 
 impl StorageTypes {

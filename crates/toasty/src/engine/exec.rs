@@ -1,6 +1,9 @@
 mod action;
 pub(crate) use action::Action;
 
+mod count_documents;
+pub(crate) use count_documents::CountDocuments;
+
 mod delete_by_key;
 pub(crate) use delete_by_key::DeleteByKey;
 
@@ -158,6 +161,7 @@ impl Engine {
 impl Exec<'_> {
     async fn exec_step(&mut self, action: &Action) -> Result<()> {
         match action {
+            Action::CountDocuments(action) => self.action_count_documents(action).await,
             Action::DeleteByKey(action) => self.action_delete_by_key(action).await,
             Action::Eval(action) => self.action_eval(action).await,
             Action::ExecStatement(action) => self.action_exec_statement(action).await,

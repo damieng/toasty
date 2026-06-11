@@ -314,10 +314,10 @@ impl LowerStatement<'_, '_> {
             _ => None,
         };
         if let Some(via) = via {
-            if !self.capability().sql {
+            if !self.capability().native_join {
                 todo!(
-                    "`.include()` / `.select()` of a multi-step `via` relation is only \
-                     supported on SQL backends; query the relation directly instead"
+                    "`.include()` / `.select()` of a multi-step `via` relation requires \
+                     `native_join`; query the relation directly instead"
                 );
             }
             return self.build_via_include_subquery(field_index, via, nested);

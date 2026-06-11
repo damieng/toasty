@@ -5,8 +5,8 @@ use indexmap::{IndexSet, indexset};
 use crate::engine::mir::Eval;
 
 use super::{
-    Const, DeleteByKey, ExecStatement, Filter, FindPkByIndex, GetByKey, Guard, NestedMerge, Node,
-    Project, QueryPk, ReadModifyWrite, Scan, UpdateByKey,
+    Const, CountDocuments, DeleteByKey, ExecStatement, Filter, FindPkByIndex, GetByKey, Guard,
+    NestedMerge, Node, Project, QueryPk, ReadModifyWrite, Scan, UpdateByKey,
 };
 
 /// A step in the query execution plan.
@@ -17,6 +17,8 @@ use super::{
 pub(crate) enum Operation {
     /// A constant value
     Const(Const),
+
+    CountDocuments(CountDocuments),
 
     DeleteByKey(DeleteByKey),
 
@@ -59,6 +61,7 @@ impl From<Operation> for Node {
     fn from(value: Operation) -> Self {
         let deps = match &value {
             Operation::Const(_m) => IndexSet::new(),
+            Operation::CountDocuments(_m) => IndexSet::new(),
             Operation::DeleteByKey(m) => indexset![m.input],
             Operation::Eval(m) => m.inputs.clone(),
             Operation::ExecStatement(m) => m.inputs.clone(),

@@ -1,6 +1,9 @@
 mod r#const;
 pub(crate) use r#const::Const;
 
+mod count_documents;
+pub(crate) use count_documents::CountDocuments;
+
 mod delete_by_key;
 pub(crate) use delete_by_key::DeleteByKey;
 

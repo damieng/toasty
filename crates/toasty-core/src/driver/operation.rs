@@ -8,6 +8,9 @@
 //! [`Capability::scan`](super::Capability::scan) is `true`) [`Scan`]. Both
 //! driver types handle [`Transaction`] operations.
 
+mod count_documents;
+pub use count_documents::CountDocuments;
+
 mod delete_by_key;
 pub use delete_by_key::DeleteByKey;
 
@@ -65,6 +68,11 @@ pub use update_by_key::UpdateByKey;
 /// ```
 #[derive(Debug, Clone)]
 pub enum Operation {
+    /// Count documents/rows matching an optional filter.
+    ///
+    /// Only sent to drivers with [`Capability::native_count`](super::Capability::native_count) `true`.
+    CountDocuments(CountDocuments),
+
     /// Insert a new record. Contains a lowered [`stmt::Insert`](crate::stmt::Insert) statement.
     Insert(Insert),
 
@@ -104,6 +112,7 @@ impl Operation {
     /// Returns the operation variant name for logging.
     pub fn name(&self) -> &str {
         match self {
+            Operation::CountDocuments(_) => "count_documents",
             Operation::Insert(_) => "insert",
             Operation::DeleteByKey(_) => "delete_by_key",
             Operation::FindPkByIndex(_) => "find_pk_by_index",

@@ -5,6 +5,7 @@
 //! and the translation helpers (`pk_in_filter`, `build_update_doc`,
 //! `document_to_record`, …) live in the crate root.
 
+mod count_documents;
 mod delete_by_key;
 mod find_pk_by_index;
 mod get_by_key;

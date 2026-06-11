@@ -41,6 +41,7 @@ impl Node {
     pub(crate) fn ty(&self) -> &stmt::Type {
         match &self.op {
             Operation::Const(m) => &m.ty,
+            Operation::CountDocuments(m) => &m.ty,
             Operation::DeleteByKey(m) => &m.ty,
             Operation::Eval(m) => &m.eval.ret,
             Operation::ExecStatement(m) => &m.ty,
@@ -64,6 +65,7 @@ impl Node {
     ) -> exec::Action {
         match &self.op {
             Operation::Const(op) => op.to_exec(self, var_table).into(),
+            Operation::CountDocuments(op) => op.to_exec(logical_plan, self, var_table).into(),
             Operation::DeleteByKey(op) => op.to_exec(logical_plan, self, var_table).into(),
             Operation::Eval(op) => op.to_exec(logical_plan, self, var_table).into(),
             Operation::ExecStatement(op) => op.to_exec(logical_plan, self, var_table).into(),

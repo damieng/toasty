@@ -223,15 +223,15 @@ impl ModelRoot {
         for field in &self.fields {
             field.verify(db)?;
 
-            // Multi-step (`via`) relations lower to nested `IN` subqueries.
-            // Only SQL drivers can evaluate them today; key-value drivers
-            // would need a separate per-step batched fetch strategy that
-            // is not yet implemented.
-            if matches!(&field.ty, FieldTy::Via(_)) && !db.sql {
+            // Multi-step (`via`) relations lower to server-side joins.
+            // Drivers that lack `native_join` (e.g. DynamoDB, MongoDB) would
+            // need a separate per-step batched fetch strategy that is not yet
+            // implemented.
+            if matches!(&field.ty, FieldTy::Via(_)) && !db.native_join {
                 return Err(crate::Error::invalid_schema(format!(
                     "field `{}::{}` declares a multi-step `via` relation, which \
-                     requires a SQL-capable driver; the configured driver does not \
-                     support SQL",
+                     requires a driver with native join support (`native_join`); \
+                     the configured driver does not support it",
                     self.name.upper_camel_case(),
                     field.name,
                 )));
