@@ -70,13 +70,13 @@ impl toasty_driver_integration_suite::Setup for MongoDbSetup {
     }
 }
 
-// Generate all driver tests. MongoDB capability mirrors DynamoDB for now;
-// tests requiring updates/deletes will fail until those operations are
-// implemented in the driver.
 toasty_driver_integration_suite::generate_driver_tests!(
     MongoDbSetup::new(),
     sql: false,
     auto_increment: false,
+    native_count: true,
+    native_exists: true,
+    use_transactions: true,
     bigdecimal_implemented: false,
     decimal_arbitrary_precision: false,
     native_decimal: false,
