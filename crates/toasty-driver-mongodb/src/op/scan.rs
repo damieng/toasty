@@ -7,6 +7,7 @@ use toasty_core::{
     stmt::ExprContext,
 };
 
+use super::exists::{self, ExistsOutcome};
 use crate::{Connection, document_to_record, filter, paginated_response};
 
 impl Connection {
@@ -15,11 +16,20 @@ impl Connection {
         schema: &Arc<Schema>,
         op: operation::Scan,
     ) -> Result<ExecResponse> {
+        // Evaluate any EXISTS pre-conditions before translating the filter.
+        let remaining_filter = if let Some(filter_expr) = &op.filter {
+            match exists::evaluate(self, schema, filter_expr).await? {
+                ExistsOutcome::ShortCircuit => return Ok(paginated_response(vec![], None)),
+                ExistsOutcome::Proceed(rest) => rest,
+            }
+        } else {
+            None
+        };
+
         let table = schema.db.table(op.table);
         let cx = ExprContext::new_with_target(&schema.db, table);
 
-        let query = op
-            .filter
+        let query = remaining_filter
             .as_ref()
             .map(|expr| filter::translate_filter(&cx, expr))
             .transpose()?

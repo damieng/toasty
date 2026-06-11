@@ -891,8 +891,8 @@ impl Capability {
     ///   break the DynamoDB-shaped `scan_order_by_is_error` expectation.
     pub const MONGODB: Self = Self {
         native_count: true,
-        native_join: false,      // future: $lookup aggregation pipeline
-        native_exists: false,    // future: $expr + $exists
+        native_join: false, // future: $lookup aggregation pipeline
+        native_exists: true,
         use_transactions: false, // future: replica-set transactions
         ..Self::DYNAMODB
     };

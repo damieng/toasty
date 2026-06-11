@@ -7,6 +7,7 @@
 
 mod count_documents;
 mod delete_by_key;
+pub(crate) mod exists;
 mod find_pk_by_index;
 mod get_by_key;
 mod insert;

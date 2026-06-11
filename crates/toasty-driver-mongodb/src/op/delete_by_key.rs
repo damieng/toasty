@@ -7,6 +7,7 @@ use toasty_core::{
     stmt::ExprContext,
 };
 
+use super::exists::{self, ExistsOutcome};
 use crate::{Connection, and_documents, filter, pk_in_filter};
 
 impl Connection {
@@ -15,6 +16,17 @@ impl Connection {
         schema: &Arc<Schema>,
         op: operation::DeleteByKey,
     ) -> Result<ExecResponse> {
+        // Evaluate any EXISTS pre-conditions in the post-filter. If the EXISTS
+        // condition fails, the delete is a no-op.
+        let remaining_filter = if let Some(filter_expr) = &op.filter {
+            match exists::evaluate(self, schema, filter_expr).await? {
+                ExistsOutcome::ShortCircuit => return Ok(ExecResponse::count(0)),
+                ExistsOutcome::Proceed(rest) => rest,
+            }
+        } else {
+            None
+        };
+
         // MongoDB enforces unique indexes natively, so no secondary index
         // maintenance is needed (unlike the DynamoDB driver).
         let table = schema.db.table(op.table);
@@ -22,7 +34,7 @@ impl Connection {
         let cx = ExprContext::new_with_target(&schema.db, table);
 
         let mut base = pk_in_filter(table, &pk_columns, &op.keys)?;
-        if let Some(filter) = &op.filter {
+        if let Some(filter) = &remaining_filter {
             base = and_documents(base, filter::translate_filter(&cx, filter)?);
         }
 

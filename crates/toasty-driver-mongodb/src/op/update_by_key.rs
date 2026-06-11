@@ -8,6 +8,7 @@ use toasty_core::{
     stmt::{self, ExprContext},
 };
 
+use super::exists::{self, ExistsOutcome};
 use crate::{
     Connection, and_documents, build_update_doc, document_to_record, filter, pk_in_filter,
     rows_response,
@@ -19,6 +20,18 @@ impl Connection {
         schema: &Arc<Schema>,
         op: operation::UpdateByKey,
     ) -> Result<ExecResponse> {
+        // Evaluate any EXISTS pre-conditions in the post-filter. If the EXISTS
+        // condition fails (the related entity does not exist), the update is a
+        // no-op — return 0 matched rows.
+        let remaining_filter = if let Some(filter_expr) = &op.filter {
+            match exists::evaluate(self, schema, filter_expr).await? {
+                ExistsOutcome::ShortCircuit => return Ok(ExecResponse::count(0)),
+                ExistsOutcome::Proceed(rest) => rest,
+            }
+        } else {
+            None
+        };
+
         // The `#[version]` bump is an ordinary assignment handled by
         // `build_update_doc`; `op.condition` is the optimistic-lock check
         // (e.g. `version == n`). A present row that fails the condition is an
@@ -33,7 +46,7 @@ impl Connection {
 
         let base_filter = |keys: &[stmt::Value]| -> Result<Document> {
             let mut filter = pk_in_filter(table, &pk_columns, keys)?;
-            if let Some(post_filter) = &op.filter {
+            if let Some(post_filter) = &remaining_filter {
                 filter = and_documents(filter, filter::translate_filter(&cx, post_filter)?);
             }
             Ok(filter)
