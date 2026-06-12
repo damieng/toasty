@@ -1242,6 +1242,12 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
             return self.plan_count_documents_execution(stmt);
         }
 
+        // JOIN source (via relation) on a native-join driver: emit a LookupJoin node
+        // that executes as an aggregation pipeline rather than sequential queries.
+        if Self::is_join_query(&stmt) {
+            return self.plan_lookup_join_execution(stmt);
+        }
+
         // Without SQL capability, we have to plan the execution of the
         // statement based on available indices.
         let index_plan_opt = self.planner.engine.plan_index_path(&stmt)?;
@@ -1356,6 +1362,107 @@ impl<'a, 'b> PlanStatement<'a, 'b> {
             columns: self.load_data.select_items.extract_expr_references(),
             row_filter,
             limit,
+            ty,
+        }))
+    }
+
+    /// Returns `true` when the statement's source is a multi-table JOIN (via relation).
+    fn is_join_query(stmt: &stmt::Statement) -> bool {
+        let stmt::Statement::Query(query) = stmt else {
+            return false;
+        };
+        let stmt::ExprSet::Select(select) = &query.body else {
+            return false;
+        };
+        let stmt::Source::Table(source_table) = &select.source else {
+            return false;
+        };
+        !source_table.from.is_empty() && !source_table.from[0].joins.is_empty()
+    }
+
+    fn plan_lookup_join_execution(&mut self, stmt: stmt::Statement) -> Result<mir::NodeId> {
+        let stmt::Statement::Query(query) = &stmt else {
+            return Err(toasty_core::Error::unsupported_feature(
+                "lookup_join: expected a query statement",
+            ));
+        };
+        let stmt::ExprSet::Select(select) = &query.body else {
+            return Err(toasty_core::Error::unsupported_feature(
+                "lookup_join: expected a SELECT body",
+            ));
+        };
+        let stmt::Source::Table(source_table) = &select.source else {
+            return Err(toasty_core::Error::unsupported_feature(
+                "lookup_join: expected a table source",
+            ));
+        };
+
+        let num_tables = source_table.tables.len();
+        debug_assert!(num_tables >= 2, "JOIN source must have at least 2 tables");
+
+        // The root-adjacent table is the last slot (build_source places target at 0,
+        // root-adjacent at the highest index).
+        let root_slot = num_tables - 1;
+        let root_table = match source_table.tables[root_slot] {
+            stmt::TableRef::Table(table_id) => table_id,
+            _ => {
+                return Err(toasty_core::Error::unsupported_feature(
+                    "lookup_join: expected a concrete table ref at root slot",
+                ));
+            }
+        };
+
+        let filter = select.filter.clone().into_expr();
+
+        // Extract the link column index from the filter.
+        // Via-join filters are always: col(root_slot, link_col_idx) = Arg::Ref(parent_key)
+        let link_column = extract_link_column_idx(&filter)?;
+
+        // Build lookup steps from joins reversed (joins are target-adjacent-first;
+        // MongoDB needs root-adjacent-first to chain $lookup stages forward).
+        let joins = &source_table.from[0].joins;
+        let mut steps = Vec::with_capacity(joins.len());
+        for join in joins.iter().rev() {
+            let stmt::JoinOp::Inner(ref constraint) = join.constraint else {
+                return Err(toasty_core::Error::unsupported_feature(
+                    "lookup_join: only INNER JOIN is supported in via paths",
+                ));
+            };
+            let (local_col, foreign_slot, foreign_col) =
+                extract_join_columns(constraint, &source_table.tables)?;
+            let foreign_table = match source_table.tables[foreign_slot] {
+                stmt::TableRef::Table(table_id) => table_id,
+                _ => {
+                    return Err(toasty_core::Error::unsupported_feature(
+                        "lookup_join: expected a concrete table ref in join",
+                    ));
+                }
+            };
+            steps.push(mir::LookupStep {
+                local_column: local_col,
+                foreign_table,
+                foreign_column: foreign_col,
+            });
+        }
+
+        let distinct = select.distinct;
+        let ty = self.infer_nosql_record_ty(&stmt);
+
+        let input = if self.load_data.inputs.is_empty() {
+            None
+        } else if self.load_data.inputs.len() == 1 {
+            Some(self.load_data.inputs[0])
+        } else {
+            todo!("lookup_join with multiple inputs")
+        };
+
+        Ok(self.insert_mir_with_deps(mir::LookupJoin {
+            input,
+            root_table,
+            filter,
+            link_column,
+            steps,
+            distinct,
             ty,
         }))
     }
@@ -1899,6 +2006,64 @@ fn extract_pagination(stmt: &stmt::Statement) -> Option<Pagination> {
             let offset = lo.offset.as_ref().map(as_i64_literal);
             Some(Pagination::Offset { limit, offset })
         }
+    }
+}
+
+/// Extracts the column index of the link column from a via-join filter.
+///
+/// Via-join filters are always `col(slot, col_idx) = Arg::Ref(...)`. Returns
+/// `col_idx`, the column index in the root-adjacent table.
+fn extract_link_column_idx(filter: &stmt::Expr) -> Result<usize> {
+    let stmt::Expr::BinaryOp(bin) = filter else {
+        return Err(toasty_core::Error::unsupported_feature(
+            "lookup_join: expected BinaryOp filter (col = Arg::Ref)",
+        ));
+    };
+    let col_expr = if matches!(&*bin.lhs, stmt::Expr::Reference(_)) {
+        &bin.lhs
+    } else {
+        &bin.rhs
+    };
+    let stmt::Expr::Reference(stmt::ExprReference::Column(col)) = &**col_expr else {
+        return Err(toasty_core::Error::unsupported_feature(
+            "lookup_join: filter LHS is not a column reference",
+        ));
+    };
+    Ok(col.column)
+}
+
+/// Extracts `(local_col_idx, foreign_slot, foreign_col_idx)` from an INNER JOIN
+/// constraint expression.
+///
+/// The constraint is `col(local_slot, local_col) = col(foreign_slot, foreign_col)`
+/// where `local_slot > foreign_slot` (local is the newly joined table, foreign
+/// is the already-placed table with the lower slot index).
+fn extract_join_columns(
+    constraint: &stmt::Expr,
+    tables: &[stmt::TableRef],
+) -> Result<(usize, usize, usize)> {
+    let stmt::Expr::BinaryOp(bin) = constraint else {
+        return Err(toasty_core::Error::unsupported_feature(
+            "lookup_join: expected BinaryOp JOIN constraint",
+        ));
+    };
+    let (
+        stmt::Expr::Reference(stmt::ExprReference::Column(lhs)),
+        stmt::Expr::Reference(stmt::ExprReference::Column(rhs)),
+    ) = (&*bin.lhs, &*bin.rhs)
+    else {
+        return Err(toasty_core::Error::unsupported_feature(
+            "lookup_join: JOIN constraint must compare two column references",
+        ));
+    };
+
+    // build_source always puts the local (newly joined) table at the higher
+    // slot index; the foreign (already placed) table has the lower slot.
+    let _ = tables; // passed for future composite-key validation
+    if lhs.table > rhs.table {
+        Ok((lhs.column, rhs.table, rhs.column))
+    } else {
+        Ok((rhs.column, lhs.table, lhs.column))
     }
 }
 

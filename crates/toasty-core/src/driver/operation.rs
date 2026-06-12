@@ -11,6 +11,9 @@
 mod count_documents;
 pub use count_documents::CountDocuments;
 
+mod lookup_join;
+pub use lookup_join::{LookupJoin, LookupStep};
+
 mod delete_by_key;
 pub use delete_by_key::DeleteByKey;
 
@@ -73,6 +76,11 @@ pub enum Operation {
     /// Only sent to drivers with [`Capability::native_count`](super::Capability::native_count) `true`.
     CountDocuments(CountDocuments),
 
+    /// Cross-collection join executed as an aggregation pipeline.
+    ///
+    /// Only sent to drivers with [`Capability::native_join`](super::Capability::native_join) `true`.
+    LookupJoin(LookupJoin),
+
     /// Insert a new record. Contains a lowered [`stmt::Insert`](crate::stmt::Insert) statement.
     Insert(Insert),
 
@@ -113,6 +121,7 @@ impl Operation {
     pub fn name(&self) -> &str {
         match self {
             Operation::CountDocuments(_) => "count_documents",
+            Operation::LookupJoin(_) => "lookup_join",
             Operation::Insert(_) => "insert",
             Operation::DeleteByKey(_) => "delete_by_key",
             Operation::FindPkByIndex(_) => "find_pk_by_index",

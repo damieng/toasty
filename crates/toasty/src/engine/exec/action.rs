@@ -1,6 +1,6 @@
 use crate::engine::exec::{
     CountDocuments, DeleteByKey, Eval, ExecStatement, Filter, FindPkByIndex, GetByKey, Guard,
-    NestedMerge, Project, QueryPk, ReadModifyWrite, Scan, SetVar, UpdateByKey,
+    LookupJoin, NestedMerge, Project, QueryPk, ReadModifyWrite, Scan, SetVar, UpdateByKey,
 };
 
 use std::fmt;
@@ -25,6 +25,9 @@ pub(crate) enum Action {
 
     /// Execute `Operation::GetByKey` using key input
     GetByKey(GetByKey),
+
+    /// Execute a cross-collection join via `$lookup` aggregation
+    LookupJoin(LookupJoin),
 
     /// Conditionally pass through or suppress a data stream
     Guard(Guard),
@@ -67,6 +70,7 @@ impl Action {
             Action::Filter(_) => "filter",
             Action::FindPkByIndex(_) => "find_pk_by_index",
             Action::GetByKey(_) => "get_by_key",
+            Action::LookupJoin(_) => "lookup_join",
             Action::Guard(_) => "guard",
             Action::NestedMerge(_) => "nested_merge",
             Action::Project(_) => "project",
@@ -89,6 +93,7 @@ impl Action {
             | Action::ExecStatement(_)
             | Action::FindPkByIndex(_)
             | Action::GetByKey(_)
+            | Action::LookupJoin(_)
             | Action::QueryPk(_)
             | Action::ReadModifyWrite(_)
             | Action::Scan(_)
@@ -114,6 +119,7 @@ impl fmt::Debug for Action {
             Self::Filter(a) => a.fmt(f),
             Self::FindPkByIndex(a) => a.fmt(f),
             Self::GetByKey(a) => a.fmt(f),
+            Self::LookupJoin(a) => a.fmt(f),
             Self::Guard(a) => a.fmt(f),
             Self::NestedMerge(a) => a.fmt(f),
             Self::QueryPk(a) => a.fmt(f),

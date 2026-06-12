@@ -23,7 +23,10 @@ mod get_by_key;
 pub(crate) use get_by_key::GetByKey;
 
 mod guard;
+
+mod lookup_join;
 pub(crate) use guard::Guard;
+pub(crate) use lookup_join::{LookupJoin, LookupStep};
 
 mod kv;
 
@@ -168,6 +171,7 @@ impl Exec<'_> {
             Action::Filter(action) => self.action_filter(action).await,
             Action::FindPkByIndex(action) => self.action_find_pk_by_index(action).await,
             Action::GetByKey(action) => self.action_get_by_key(action).await,
+            Action::LookupJoin(action) => self.action_lookup_join(action).await,
             Action::Guard(action) => self.action_guard(action).await,
             Action::NestedMerge(action) => self.action_nested_merge(action).await,
             Action::QueryPk(action) => self.action_query_pk(action).await,

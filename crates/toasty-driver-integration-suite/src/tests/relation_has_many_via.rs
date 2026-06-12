@@ -11,7 +11,7 @@ use crate::prelude::*;
 /// the path — a target is listed once however many intermediates reach it.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_comment_article)
 )]
 pub async fn query_returns_distinct_targets(test: &mut Test) -> Result<()> {
@@ -59,7 +59,7 @@ pub async fn query_returns_distinct_targets(test: &mut Test) -> Result<()> {
 /// A user with no comments reaches no articles — an empty result, no error.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_comment_article)
 )]
 pub async fn query_with_no_intermediates_is_empty(test: &mut Test) -> Result<()> {
@@ -82,7 +82,7 @@ pub async fn query_with_no_intermediates_is_empty(test: &mut Test) -> Result<()>
 /// query.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_comment_article)
 )]
 pub async fn via_relation_query_can_be_filtered(test: &mut Test) -> Result<()> {
@@ -140,7 +140,7 @@ pub async fn via_relation_query_can_be_filtered(test: &mut Test) -> Result<()> {
 /// BelongsTo shape (User → Comment → Article).
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_comment_article)
 )]
 pub async fn include_via_two_step(test: &mut Test) -> Result<()> {
@@ -215,7 +215,7 @@ pub async fn include_via_two_step(test: &mut Test) -> Result<()> {
 /// structs, so `User`/`Todo`/etc. only exist inside a scenario-scoped test fn.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_org_project_todo)
 )]
 pub async fn include_via_three_step(test: &mut Test) -> Result<()> {
@@ -314,7 +314,7 @@ pub async fn include_via_three_step(test: &mut Test) -> Result<()> {
 /// shape, same expected grouping.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_org_project_todo)
 )]
 pub async fn include_via_nested_via(test: &mut Test) -> Result<()> {
@@ -419,7 +419,7 @@ pub async fn include_via_nested_via(test: &mut Test) -> Result<()> {
 /// collapses to one. Navigation and `.include()` must agree.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_org_project_todo)
 )]
 pub async fn scalar_via_of_via(test: &mut Test) -> Result<()> {
@@ -487,7 +487,7 @@ pub async fn scalar_via_of_via(test: &mut Test) -> Result<()> {
 /// `INNER JOIN` excludes them but the parent row is still returned.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_org_project_todo)
 )]
 pub async fn include_via_three_step_no_intermediates(test: &mut Test) -> Result<()> {
@@ -514,7 +514,7 @@ pub async fn include_via_three_step_no_intermediates(test: &mut Test) -> Result<
 /// twice.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_comment_article)
 )]
 pub async fn select_via_two_step(test: &mut Test) -> Result<()> {
@@ -560,7 +560,7 @@ pub async fn select_via_two_step(test: &mut Test) -> Result<()> {
 /// missing intermediate both surface as `None`.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_account_subscription)
 )]
 pub async fn include_via_has_one(test: &mut Test) -> Result<()> {
@@ -610,7 +610,7 @@ pub async fn include_via_has_one(test: &mut Test) -> Result<()> {
 /// test, so this focuses on a matched chain returning the target.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_account_subscription)
 )]
 pub async fn select_via_has_one(test: &mut Test) -> Result<()> {
@@ -646,7 +646,7 @@ pub async fn select_via_has_one(test: &mut Test) -> Result<()> {
 /// comments appears once.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_comment_article)
 )]
 pub async fn query_scalar_via_returns_distinct_titles(test: &mut Test) -> Result<()> {
@@ -697,7 +697,7 @@ pub async fn query_scalar_via_returns_distinct_titles(test: &mut Test) -> Result
 /// both semantics collapse identically. Navigation and `.include()` must agree.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_comment_article)
 )]
 pub async fn scalar_via_distinct_values_across_distinct_targets(test: &mut Test) -> Result<()> {
@@ -752,7 +752,7 @@ pub async fn scalar_via_distinct_values_across_distinct_targets(test: &mut Test)
 /// across comments appears once. Navigation and `.include()` must agree.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_comment_article)
 )]
 pub async fn query_scalar_via_two_step(test: &mut Test) -> Result<()> {
@@ -791,7 +791,7 @@ pub async fn query_scalar_via_two_step(test: &mut Test) -> Result<()> {
 /// parent, grouped by user, with duplicates collapsed.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_comment_article)
 )]
 pub async fn include_scalar_via(test: &mut Test) -> Result<()> {
@@ -857,7 +857,7 @@ pub async fn include_scalar_via(test: &mut Test) -> Result<()> {
 /// titles reachable from the matched users.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_comment_article)
 )]
 pub async fn query_chain_scalar_via(test: &mut Test) -> Result<()> {
@@ -893,7 +893,7 @@ pub async fn query_chain_scalar_via(test: &mut Test) -> Result<()> {
 /// parent row.
 #[driver_test(
     id(ID),
-    requires(sql),
+    requires(native_join),
     scenario(crate::scenarios::user_comment_article)
 )]
 pub async fn select_scalar_via(test: &mut Test) -> Result<()> {
@@ -935,7 +935,11 @@ pub async fn select_scalar_via(test: &mut Test) -> Result<()> {
 /// `ViaManyField for Vec<E>` (`DEFERRED = false`) impl and via auto-loading. The
 /// load groups per user and collapses duplicate values, like the explicit
 /// `.include()` paths.
-#[driver_test(id(ID), requires(sql), scenario(crate::scenarios::user_tag_names))]
+#[driver_test(
+    id(ID),
+    requires(native_join),
+    scenario(crate::scenarios::user_tag_names)
+)]
 pub async fn eager_scalar_via_auto_loads(test: &mut Test) -> Result<()> {
     let mut db = setup(test).await;
 

@@ -75,6 +75,7 @@ toasty_driver_integration_suite::generate_driver_tests!(
     sql: false,
     auto_increment: false,
     native_count: true,
+    native_join: true,
     native_exists: true,
     use_transactions: true,
     bigdecimal_implemented: false,

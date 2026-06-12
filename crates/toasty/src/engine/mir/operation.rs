@@ -6,7 +6,7 @@ use crate::engine::mir::Eval;
 
 use super::{
     Const, CountDocuments, DeleteByKey, ExecStatement, Filter, FindPkByIndex, GetByKey, Guard,
-    NestedMerge, Node, Project, QueryPk, ReadModifyWrite, Scan, UpdateByKey,
+    LookupJoin, NestedMerge, Node, Project, QueryPk, ReadModifyWrite, Scan, UpdateByKey,
 };
 
 /// A step in the query execution plan.
@@ -21,6 +21,9 @@ pub(crate) enum Operation {
     CountDocuments(CountDocuments),
 
     DeleteByKey(DeleteByKey),
+
+    /// Cross-collection join (via `$lookup`) for NoSQL drivers with `native_join`.
+    LookupJoin(LookupJoin),
 
     Eval(Eval),
 
@@ -63,6 +66,7 @@ impl From<Operation> for Node {
             Operation::Const(_m) => IndexSet::new(),
             Operation::CountDocuments(_m) => IndexSet::new(),
             Operation::DeleteByKey(m) => indexset![m.input],
+            Operation::LookupJoin(m) => m.input.into_iter().collect(),
             Operation::Eval(m) => m.inputs.clone(),
             Operation::ExecStatement(m) => m.inputs.clone(),
             Operation::Filter(m) => indexset![m.input],

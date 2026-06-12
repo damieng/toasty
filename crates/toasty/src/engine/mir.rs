@@ -7,6 +7,9 @@ pub(crate) use count_documents::CountDocuments;
 mod delete_by_key;
 pub(crate) use delete_by_key::DeleteByKey;
 
+mod lookup_join;
+pub(crate) use lookup_join::{LookupJoin, LookupStep};
+
 mod exec_statement;
 pub(crate) use exec_statement::ExecStatement;
 

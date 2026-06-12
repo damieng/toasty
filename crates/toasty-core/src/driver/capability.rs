@@ -883,6 +883,9 @@ impl Capability {
     ///   assignments, so the flags stay `false` until it does. Enabling them
     ///   first would make the planner emit collection mutations the driver
     ///   rejects.
+    /// * `native_join` — enabled; multi-step (`via`) relations use a
+    ///   `$lookup` + `$unwind` aggregation pipeline to traverse collections
+    ///   server-side, mirroring SQL `INNER JOIN` semantics.
     /// * `native_*` temporal/decimal — values are stored with the string
     ///   encodings from [`StorageTypes::DYNAMODB`]; native BSON `Date` /
     ///   `Decimal128` encoding is future work.
@@ -891,7 +894,7 @@ impl Capability {
     ///   break the DynamoDB-shaped `scan_order_by_is_error` expectation.
     pub const MONGODB: Self = Self {
         native_count: true,
-        native_join: false, // future: $lookup aggregation pipeline
+        native_join: true,
         native_exists: true,
         use_transactions: true,
         ..Self::DYNAMODB
