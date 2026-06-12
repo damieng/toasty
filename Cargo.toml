@@ -22,7 +22,6 @@ members = [
     # Examples
     "examples/composite-key",
     "examples/hello-toasty",
-    "examples/orders",
     "examples/todo-with-cli",
     "examples/user-has-one-profile",
 
@@ -45,7 +44,6 @@ default-members = [
     "crates/toasty-driver-integration-suite-macros",
     "examples/composite-key",
     "examples/hello-toasty",
-    "examples/orders",
     "examples/todo-with-cli",
     "examples/user-has-one-profile",
     "tests",
